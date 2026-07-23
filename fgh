@@ -1,0 +1,611 @@
+#!/usr/bin/env bash
+# fgh — Forgejo CLI wrapper using gh-style subcommands
+# Auto-detects repo from git remote in current directory
+#
+# Usage:
+#   fgh issue list              List open issues
+#   fgh issue list closed       List closed issues
+#   fgh issue view N            View issue N
+#   fgh issue create            Create issue (interactive)
+#   fgh issue close N           Close issue
+#   fgh issue open N            Reopen issue
+#   fgh issue comment N MSG     Add comment to issue
+#   fgh pr list                 List open PRs
+#   fgh pr view N               View PR N
+#   fgh actions list            List workflow runs
+#   fgh actions view N          View run details + jobs
+#   fgh actions watch N         Watch run until done
+#   fgh actions logs N [JOB_ID] Get run (or job) logs
+#   fgh actions cancel N        Cancel run (Forgejo 16.0+)
+#   fgh api ENDPOINT            Raw API call (GET)
+#   fgh api -X POST ENDPOINT    Raw API call (POST)
+#   fgh repo view               View current repo
+
+set -euo pipefail
+
+: "${FORGEJO_URL:?FORGEJO_URL must be set}"
+: "${FORGEJO_TOKEN:?FORGEJO_TOKEN must be set}"
+
+API_BASE="${FORGEJO_URL}/api/v1"
+# FGH_TOKEN > FORGEJO_ISSUE_TOKEN > FORGEJO_TOKEN — first set wins
+AUTH_TOKEN="${FGH_TOKEN:-${FORGEJO_ISSUE_TOKEN:-$FORGEJO_TOKEN}}"
+# FGH_DEFAULT_ASSIGNEE: username to auto-assign when --assignee is not given
+: "${FGH_DEFAULT_ASSIGNEE:=}"
+# ── repo detection ──────────────────────────────────────────────────
+# Try git remote first, then fall back to FGH_REPO env var, then error
+if [[ -n "${FGH_REPO:-}" ]]; then
+    REPO_OWNER="${FGH_REPO%%/*}"
+    REPO_NAME="${FGH_REPO#*/}"
+else
+    REMOTE_URL=$(git remote get-url origin 2>/dev/null) || true
+    if [[ -z "$REMOTE_URL" ]]; then
+        echo "Error: not in a git repo and FGH_REPO not set. Set FGH_REPO=owner/repo or run from a git clone." >&2
+        exit 1
+    fi
+    # Extract owner/repo from various remote formats:
+    #   git@git.theiahd.nl:djdembeck/milmus.git
+    #   ssh://git@git.theiahd.nl:2222/djdembeck/infrastructure.git
+    #   https://git.theiahd.nl/djdembeck/milmus.git
+    REPO_PATH=$(echo "$REMOTE_URL" | sed -E \
+        -e 's|^git@[^:]+:||' \
+        -e 's|^ssh://git@[^:]+:[0-9]+/||' \
+        -e 's|^https?://[^/]+/||' \
+        -e 's|\.git$||')
+    REPO_OWNER="${REPO_PATH%%/*}"
+    REPO_NAME="${REPO_PATH#*/}"
+fi
+
+_curl() {
+    curl -sSL -H "Authorization: token ${AUTH_TOKEN}" \
+         -H "Content-Type: application/json" \
+         -H "Accept: application/json" \
+         "$@"
+}
+
+repo_path() { echo "repos/${REPO_OWNER}/${REPO_NAME}"; }
+
+# ── issue ──────────────────────────────────────────────────────────
+cmd_issue() {
+    local sub="${1:-list}"; shift 2>/dev/null || true
+    case "$sub" in
+        list)
+            local state="${1:-open}"
+            local page=1 limit=50
+            local all_issues="[]"
+            while true; do
+                local batch
+                batch=$(_curl "${API_BASE}/$(repo_path)/issues?state=${state}&page=${page}&limit=${limit}&type=issues")
+                local count
+                count=$(echo "$batch" | jq 'length')
+                [[ "$count" == "0" ]] && break
+                all_issues=$(echo "$all_issues" "$batch" | jq -s 'add')
+                (( count < limit )) && break
+                ((page++))
+            done
+            echo "$all_issues" | jq -r '.[] |
+                "\(.number)\t\(.state)\t\(.labels | map(.name) | join(","))\t\(.title)"' \
+                | column -ts$'\t' -N '#,STATE,LABELS,TITLE'
+            ;;
+        view)
+            local num="${1:?issue number required}"
+            _curl "${API_BASE}/$(repo_path)/issues/${num}" | jq '{
+                number, state, title,
+                labels: [.labels[].name],
+                assignee: .assignee.login,
+                created: .created_at,
+                updated: .updated_at,
+                body
+            }'
+            ;;
+        create)
+            local title body assignees=() labels=() label_ids=()
+            if [[ -t 0 ]]; then
+                echo "Title: " >&2; read -r title
+                echo "Body (Ctrl-D to finish):" >&2
+                body=$(cat)
+            else
+                title="${1:?title required}"; shift
+                while [[ $# -gt 0 ]]; do
+                    case "$1" in
+                        --body-file)
+                            shift
+                            if [[ "${1:-}" == "-" ]]; then
+                                body=$(cat)
+                            else
+                                body="$(cat "${1:?--body-file requires a path}")"
+                            fi
+                            shift
+                            ;;
+                        --body)
+                            shift
+                            body="${1:?--body requires a value}"
+                            shift
+                            ;;
+                        --assignee)
+                            shift
+                            assignees+=("${1:?--assignee requires a username}")
+                            shift
+                            ;;
+                        --label)
+                            shift
+                            labels+=("${1:?--label requires a name}")
+                            shift
+                            ;;
+                        *)
+                            body="${1:-}"
+                            shift
+                            ;;
+                    esac
+                done
+            fi
+            # Resolve label names to IDs (Forgejo requires int64 IDs, not strings)
+            if [[ ${#labels[@]} -gt 0 ]]; then
+                local label_map
+                label_map=$(_curl "${API_BASE}/$(repo_path)/labels" | jq -r '.[] | "\(.name)\t\(.id)"')
+                for lbl in "${labels[@]}"; do
+                    local lid
+                    lid=$(echo "$label_map" | awk -F$'\t' -v l="$lbl" '$1 == l {print $2; exit}')
+                    if [[ -n "$lid" ]]; then
+                        label_ids+=("$lid")
+                    else
+                        # Auto-create missing label
+                        local new_label
+                        new_label=$(_curl -X POST -d "{\"name\":\"$lbl\",\"color\":\"c5c5c5\"}" "${API_BASE}/$(repo_path)/labels" | jq -r '.id')
+                        if [[ -n "$new_label" && "$new_label" != "null" ]]; then
+                            label_ids+=("$new_label")
+                            echo "Created label: $lbl (id=$new_label)" >&2
+                        else
+                            echo "Warning: failed to create label '$lbl', skipping" >&2
+                        fi
+                    fi
+                done
+            fi
+            # Apply default assignee if none specified
+            if [[ ${#assignees[@]} -eq 0 && -n "$FGH_DEFAULT_ASSIGNEE" ]]; then
+                assignees=("$FGH_DEFAULT_ASSIGNEE")
+            fi
+            local payload assignees_json labels_json
+            if [[ ${#assignees[@]} -gt 0 ]]; then
+                assignees_json=$(printf '%s\n' "${assignees[@]}" | jq -R . | jq -s .)
+            else
+                assignees_json='[]'
+            fi
+            if [[ ${#label_ids[@]} -gt 0 ]]; then
+                labels_json=$(printf '%s\n' "${label_ids[@]}" | jq -R . | jq -s 'map(.|tonumber)')
+            else
+                labels_json='[]'
+            fi
+            payload=$(jq -n --arg t "$title" --arg b "$body" \
+                --argjson a "$assignees_json" \
+                --argjson l "$labels_json" \
+                '{title:$t,body:$b,assignees:$a,labels:$l}')
+            _curl -X POST -d "$payload" "${API_BASE}/$(repo_path)/issues" | jq '{number, title, html_url}'
+            ;;
+        close)
+            local num="${1:?issue number required}"
+            _curl -X PATCH -d '{"state":"closed"}' "${API_BASE}/$(repo_path)/issues/${num}" | jq '{number, state, title}'
+            ;;
+        open)
+            local num="${1:?issue number required}"
+            _curl -X PATCH -d '{"state":"open"}' "${API_BASE}/$(repo_path)/issues/${num}" | jq '{number, state, title}'
+            ;;
+        comment)
+            local num="${1:?issue number required}"; shift
+            local body="${*:?comment body required}"
+            local payload
+            payload=$(jq -n --arg b "$body" '{body:$b}')
+            _curl -X POST -d "$payload" "${API_BASE}/$(repo_path)/issues/${num}/comments" | jq '{id, created_at}'
+            ;;
+        *)
+            echo "Usage: fgh issue {list|view|create|close|open|comment}" >&2; return 1
+            ;;
+    esac
+}
+
+# ── label ──────────────────────────────────────────────────────────
+cmd_label() {
+    local sub="${1:-list}"; shift 2>/dev/null || true
+    case "$sub" in
+        list)
+            _curl "${API_BASE}/$(repo_path)/labels" | jq -r '.[] | "\(.id)\t\(.name)\t\(.color)\t\(.description)"' \
+                | column -ts$'\t' -N 'ID,NAME,COLOR,DESCRIPTION'
+            ;;
+        create)
+            local name="${1:?name required}"; shift || true
+            local color="${1:-c5c5c5}"; shift || true
+            local desc="${1:-}"
+            local payload
+            payload=$(jq -n --arg n "$name" --arg c "$color" --arg d "$desc" '{name:$n,color:$c,description:$d}')
+            _curl -X POST -d "$payload" "${API_BASE}/$(repo_path)/labels" | jq '{id, name, color}'
+            ;;
+        ensure)
+            # Ensure standard labels exist. Creates any that are missing.
+            local existing
+            existing=$(_curl "${API_BASE}/$(repo_path)/labels" | jq -r '.[].name')
+            # Standard labels: name color description
+            local -A std_labels
+            std_labels[bug]="d73a4a|Something isn't working"
+            std_labels[enhancement]="84b6eb|New feature or request"
+            std_labels[documentation]="0075ca|Improvements or additions to documentation"
+            std_labels[security]="b60205|Security vulnerability or concern"
+            std_labels[performance]="fbca04|Performance issue or improvement"
+            local created=0 skipped=0
+            for name in "${!std_labels[@]}"; do
+                if echo "$existing" | grep -qx "$name"; then
+                    ((skipped++)) || true
+                else
+                    local IFS='|'
+                    read -r color desc <<< "${std_labels[$name]}"
+                    local payload
+                    payload=$(jq -n --arg n "$name" --arg c "$color" --arg d "$desc" '{name:$n,color:$c,description:$d}')
+                    _curl -X POST -d "$payload" "${API_BASE}/$(repo_path)/labels" > /dev/null
+                    echo "Created label: $name" >&2
+                    ((created++)) || true
+                fi
+            done
+            echo "Labels ensured: $created created, $skipped already existed"
+            ;;
+        *)
+            echo "Usage: fgh label {list|create|ensure}" >&2; return 1
+            ;;
+    esac
+}
+
+# ── pr ──────────────────────────────────────────────────────────────
+cmd_pr() {
+    local sub="${1:-list}"; shift 2>/dev/null || true
+    case "$sub" in
+        list)
+            local state="${1:-open}"
+            local page=1 limit=50
+            local all_prs="[]"
+            while true; do
+                local batch
+                batch=$(_curl "${API_BASE}/$(repo_path)/pulls?state=${state}&page=${page}&limit=${limit}")
+                local count
+                count=$(echo "$batch" | jq 'length')
+                [[ "$count" == "0" ]] && break
+                all_prs=$(echo "$all_prs" "$batch" | jq -s 'add')
+                (( count < limit )) && break
+                ((page++))
+            done
+            echo "$all_prs" | jq -r '.[] |
+                "\(.number)\t\(.state)\t\(.user.login)\t\(.head.ref)\t\(.title)"' \
+                | column -ts$'\t' -N '#,STATE,AUTHOR,BRANCH,TITLE'
+            ;;
+        view)
+            local num="${1:?PR number required}"
+            _curl "${API_BASE}/$(repo_path)/pulls/${num}" | jq '{
+                number, state, title,
+                user: .user.login,
+                head: .head.ref, base: .base.ref,
+                mergeable, additions, deletions, changed_files,
+                created: .created_at, updated: .updated_at,
+                body
+            }'
+            ;;
+        reviews)
+            local num="${1:?PR number required}"
+            _curl "${API_BASE}/$(repo_path)/pulls/${num}/reviews" | jq '[.[] | {id, user: .user.login, state}]'
+            ;;
+        review-comments)
+            local num="${1:?PR number required}"
+            local reviews
+            reviews=$(_curl "${API_BASE}/$(repo_path)/pulls/${num}/reviews" | jq -r '.[] | .id')
+            local all_comments="[]"
+            for rid in $reviews; do
+                local batch
+                batch=$(_curl "${API_BASE}/$(repo_path)/pulls/${num}/reviews/${rid}/comments")
+                all_comments=$(echo "$all_comments" "$batch" | jq -s 'add')
+            done
+            echo "$all_comments" | jq '[.[] | {path, line, body}]'
+            ;;
+        *)
+            echo "Usage: fgh pr {list|view|reviews|review-comments}" >&2; return 1
+            ;;
+    esac
+}
+
+# ── api ─────────────────────────────────────────────────────────────
+cmd_api() {
+    local method="GET"
+    if [[ "${1:-}" == "-X" ]]; then
+        method="$2"; shift 2
+    fi
+    local endpoint="${1:?endpoint required}"; shift || true
+    local data="${1:-}"
+    if [[ -n "$data" ]]; then
+        _curl -X "$method" -d "$data" "${API_BASE}/${endpoint}"
+    else
+        _curl -X "$method" "${API_BASE}/${endpoint}"
+    fi
+}
+
+# ── repo ────────────────────────────────────────────────────────────
+cmd_repo() {
+    local sub="${1:-view}"; shift 2>/dev/null || true
+    case "$sub" in
+        view)
+            _curl "${API_BASE}/$(repo_path)" | jq '{
+                full_name, description, language,
+                stars: .stars_count, forks: .forks_count,
+                open_issues: .open_issues_count,
+                created: .created_at, updated: .updated_at,
+                html_url
+            }'
+            ;;
+        *)
+            echo "Usage: fgh repo {view}" >&2; return 1
+            ;;
+    esac
+}
+
+# ── actions ──────────────────────────────────────────────────────────
+cmd_actions() {
+    local sub="${1:?Usage: fgh actions <list|view|watch|logs|cancel|delete|jobs|artifact|secret|variable|runner>}"; shift
+    case "$sub" in
+        list)
+            local result
+            result=$(_curl "${API_BASE}/$(repo_path)/actions/runs")
+            echo "$result" | jq -r '.workflow_runs // [] | .[:20] |
+                ("ID\tSTATUS\tEVENT\tBRANCH\tCOMMIT\tSTARTED\tTITLE"),
+                (.[] | [
+                    (.id|tostring),
+                    (.status // "-"),
+                    (.event // "-"),
+                    (.prettyref // "-"),
+                    ((.commit_sha // "-")[:12]),
+                    ((.started // .created // "-") | if . != "-" then .[:19] else . end),
+                    ((.title // "-")[:60])
+                ] | @tsv)
+            ' | column -ts$'\t'
+            ;;
+        view)
+            local run_id="${1:?run ID required}"
+            _curl "${API_BASE}/$(repo_path)/actions/runs/${run_id}" | jq -r '
+                "Run #\(.id)",
+                "",
+                "Title:     \(.title // "-")",
+                "Status:    \(.status // "-")",
+                "Event:     \(.event // "-")",
+                "Branch:    \(.prettyref // "-")",
+                "Commit:    \((.commit_sha // "-")[:12])",
+                "Started:   \(.started // .created // "-")",
+                "Stopped:   \(.stopped // "-")",
+                "Duration:  \(if .duration then "\(.duration / 1000000000 | floor)s" else "-" end)",
+                "Trigger:   \(.trigger_user.login // "-")",
+                "URL:       \(.html_url // "-")"
+            '
+            echo ""
+            echo "--- Jobs ---"
+            local jobs
+            jobs=$(_curl "${API_BASE}/$(repo_path)/actions/runs/${run_id}/jobs" 2>/dev/null || echo '[]')
+            echo "$jobs" | jq -r '
+                if type == "array" then
+                    if length == 0 then "  No jobs found."
+                    else .[] | "  [\(.status)] \(.name // "job \(.id)")"
+                    end
+                else "  Job data unavailable."
+                end
+            '
+            ;;
+        watch)
+            local run_id="${1:?run ID required}"
+            echo -n "Watching run #$run_id..."
+            while true; do
+                local status
+                status=$(_curl "${API_BASE}/$(repo_path)/actions/runs/${run_id}" | jq -r '.status')
+                local title
+                title=$(_curl "${API_BASE}/$(repo_path)/actions/runs/${run_id}" | jq -r '.title // "-"')
+                printf "\r[%-10s] %s" "$status" "$title"
+                if [[ "$status" == "success" || "$status" == "failure" || "$status" == "cancelled" ]]; then
+                    echo ""
+                    break
+                fi
+                sleep 5
+            done
+            ;;
+        logs)
+            local run_id="${1:?run ID required}"; shift
+            local job_id="${1:-}"
+            if [[ -n "$job_id" ]]; then
+                _curl "${API_BASE}/$(repo_path)/actions/runs/${run_id}/jobs/${job_id}/logs" | gunzip 2>/dev/null || cat
+            else
+                _curl "${API_BASE}/$(repo_path)/actions/runs/${run_id}/logs" | gunzip 2>/dev/null || cat
+            fi
+            ;;
+        jobs)
+            local run_id="${1:?run ID required}"
+            _curl "${API_BASE}/$(repo_path)/actions/runs/${run_id}/jobs" 2>/dev/null | jq -r '
+                ("ID\tNAME\tSTATUS\tSTARTED\tDURATION"),
+                (.[] | [
+                    (.id|tostring),
+                    (.name // "-"),
+                    (.status // "-"),
+                    ((.started // "-")[:19]),
+                    (.duration | if . == null then "-" else "\(. / 1000000000 | floor)s" end)
+                ] | @tsv)
+            ' | column -ts$'\t'
+            ;;
+        cancel)
+            local run_id="${1:?run ID required}"
+            _curl -X POST "${API_BASE}/$(repo_path)/actions/runs/${run_id}/cancel" > /dev/null
+            echo "Cancelled run #$run_id"
+            ;;
+        delete)
+            local run_id="${1:?run ID required}"
+            _curl -X DELETE "${API_BASE}/$(repo_path)/actions/runs/${run_id}" > /dev/null
+            echo "Deleted run #$run_id"
+            ;;
+        artifact)
+            local sub2="${1:?Usage: fgh actions artifact <list|download|delete>}"; shift
+            case "$sub2" in
+                list)
+                    local result
+                    result=$(_curl "${API_BASE}/$(repo_path)/actions/artifacts?limit=30")
+                    if echo "$result" | jq -e '.message' > /dev/null 2>&1; then
+                        echo "$(echo "$result" | jq -r '.message')" >&2; return 1
+                    fi
+                    echo "$result" | jq -r '
+                        ("ID\tNAME\tSIZE(KB)\tEXPIRES\tCREATED"),
+                        ((. // [])[:30][] | [
+                            (.id|tostring),
+                            (.name // "-"),
+                            ((.size_in_bytes / 1024 | floor)|tostring),
+                            ((.expires_at // "never")[:10]),
+                            ((.created_at // "-")[:19])
+                        ] | @tsv)
+                    ' | column -ts$'\t'
+                    ;;
+                download)
+                    local artifact_id="${1:?artifact ID required}"
+                    local out="${2:-.}"
+                    _curl -o "$out" "${API_BASE}/$(repo_path)/actions/artifacts/${artifact_id}/zip"
+                    echo "Downloaded artifact #$artifact_id to $out" >&2
+                    ;;
+                delete)
+                    local artifact_id="${1:?artifact ID required}"
+                    _curl -X DELETE "${API_BASE}/$(repo_path)/actions/artifacts/${artifact_id}" > /dev/null
+                    echo "Deleted artifact #$artifact_id"
+                    ;;
+            esac
+            ;;
+        secret)
+            local sub2="${1:?Usage: fgh actions secret <list|set|delete>}"; shift
+            case "$sub2" in
+                list)
+                    local result
+                    result=$(_curl "${API_BASE}/$(repo_path)/actions/secrets")
+                    if echo "$result" | jq -e '.message' > /dev/null 2>&1; then
+                        echo "$(echo "$result" | jq -r '.message')" >&2; return 1
+                    fi
+                    echo "$result" | jq -r '
+                        ("NAME\tUPDATED"),
+                        ((. // [])[] | [(.name // "-"), ((.updated_at // .created_at // "-")[:19])] | @tsv)
+                    ' | column -ts$'\t'
+                    ;;
+                set)
+                    local name="${1:?secret name required}"; shift
+                    local value
+                    if [[ -t 0 ]]; then
+                        echo "Enter secret value:" >&2
+                        read -r value
+                    else
+                        value=$(cat)
+                    fi
+                    _curl -X PUT -d "{\"name\":\"$name\",\"encrypted_value\":\"$value\"}" \
+                        "${API_BASE}/$(repo_path)/actions/secrets" > /dev/null
+                    echo "Set secret: $name" >&2
+                    ;;
+                delete)
+                    local name="${1:?secret name required}"
+                    _curl -X DELETE "${API_BASE}/$(repo_path)/actions/secrets/${name}" > /dev/null
+                    echo "Deleted secret: $name"
+                    ;;
+            esac
+            ;;
+        variable)
+            local sub2="${1:?Usage: fgh actions variable <list|set|delete>}"; shift
+            case "$sub2" in
+                list)
+                    local result
+                    result=$(_curl "${API_BASE}/$(repo_path)/actions/variables")
+                    if echo "$result" | jq -e '.message' > /dev/null 2>&1; then
+                        echo "$(echo "$result" | jq -r '.message')" >&2; return 1
+                    fi
+                    echo "$result" | jq -r '
+                        ("NAME\tVALUE\tUPDATED"),
+                        ((. // [])[] | [(.name // "-"), (.value // "-"), ((.updated_at // .created_at // "-")[:19])] | @tsv)
+                    ' | column -ts$'\t'
+                    ;;
+                set)
+                    local name="${1:?variable name required}"; shift
+                    local value="${1:?variable value required}"
+                    _curl -X PUT -d "{\"name\":\"$name\",\"value\":\"$value\"}" \
+                        "${API_BASE}/$(repo_path)/actions/variables" > /dev/null
+                    echo "Set variable: $name" >&2
+                    ;;
+                delete)
+                    local name="${1:?variable name required}"
+                    _curl -X DELETE "${API_BASE}/$(repo_path)/actions/variables/${name}" > /dev/null
+                    echo "Deleted variable: $name"
+                    ;;
+            esac
+            ;;
+        runner)
+            local sub2="${1:?Usage: fgh actions runner <list|register>}"; shift
+            case "$sub2" in
+                list)
+                    local result
+                    result=$(_curl "${API_BASE}/$(repo_path)/runners" 2>/dev/null)
+                    if ! echo "$result" | jq -e '.' > /dev/null 2>&1 || echo "$result" | jq -e '.message // false' > /dev/null 2>&1; then
+                        echo "Runners endpoint not available on this Forgejo instance."
+                    else
+                        echo "$result" | jq -r '
+                            ("ID\tNAME\tSTATUS\tLABELS\tVERSION"),
+                            ((.runners // [])[] | [
+                                (.id|tostring),
+                                (.name // "-"),
+                                (.status // "-"),
+                                ((.labels // []) | join(",")),
+                                (.version // "-")
+                            ] | @tsv)
+                        ' | column -ts$'\t'
+                    fi
+                    ;;
+                register)
+                    _curl "${API_BASE}/$(repo_path)/runners/registration-token" | jq -r '.token // empty'
+                    ;;
+            esac
+            ;;
+        *)
+            echo "Usage: fgh actions {list|view|watch|logs|jobs|cancel|delete|artifact|secret|variable|runner}" >&2; return 1
+            ;;
+    esac
+}
+# ── dispatch ────────────────────────────────────────────────────────
+case "${1:-help}" in
+    issue)    shift; cmd_issue "$@" ;;
+    label)    shift; cmd_label "$@" ;;
+    pr)       shift; cmd_pr "$@" ;;
+    actions)  shift; cmd_actions "$@" ;;
+    api)      shift; cmd_api "$@" ;;
+    repo)     shift; cmd_repo "$@" ;;
+    help|--help|-h)
+        echo "fgh — Forgejo CLI wrapper"
+        echo ""
+        echo "Commands:"
+        echo "  issue list [state]       List issues (default: open)"
+        echo "  issue view N            View issue details"
+        echo "  issue create TITLE [BODY|--body VAL|--body-file FILE|-] [--assignee USER] [--label NAME]  Create issue"
+        echo "  issue close N           Close issue"
+        echo "  issue open N            Reopen issue"
+        echo "  issue comment N MSG     Add comment"
+        echo "  label list              List labels"
+        echo "  label create NAME [COLOR] [DESC]  Create label"
+        echo "  label ensure            Ensure standard labels exist"
+        echo "  pr list [state]         List PRs (default: open)"
+        echo "  pr view N               View PR details"
+        echo "  pr reviews N            List reviews on PR"
+        echo "  pr review-comments N    Get code review comments on PR"
+        echo "  actions list            List workflow runs"
+        echo "  actions view N          View run details + jobs"
+        echo "  actions watch N         Watch run until done"
+        echo "  actions logs N [JOB_ID] Get run (or job) logs"
+        echo "  actions jobs N          List jobs for run"
+        echo "  actions cancel N        Cancel run"
+        echo "  actions delete N        Delete run"
+        echo "  actions artifact list           List artifacts"
+        echo "  actions artifact download ID    Download artifact"
+        echo "  actions artifact delete ID      Delete artifact"
+        echo "  actions secret list/set/delete  Manage secrets"
+        echo "  actions variable list/set/delete Manage variables"
+        echo "  actions runner list/register    Manage runners"
+        echo "  api [-X METHOD] EP              Raw API call"
+        echo "  repo view                       View repo info"
+        echo ""
+        echo "Auto-detects repo from git remote in cwd."
+        echo "Override: FGH_REPO=owner/repo  FGH_TOKEN=token  FGH_DEFAULT_ASSIGNEE=user"
+        ;;
+    *) echo "Unknown command: $1" >&2; exit 1 ;;
+esac
