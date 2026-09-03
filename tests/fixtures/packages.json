@@ -1,0 +1,8 @@
+[
+  { "id": 31, "type": "container", "name": "widgets", "version": "1.2.3",
+    "creator": {"login": "acme"}, "created_at": "2026-07-01T00:00:00Z",
+    "html_url": "https://forgejo.test/o/r/-/packages/container/widgets/1.2.3" },
+  { "id": 32, "type": "generic", "name": "tarballs", "version": "0.1.0",
+    "creator": {"login": "acme"}, "created_at": "2026-07-15T00:00:00Z",
+    "html_url": "https://forgejo.test/o/r/-/packages/generic/tarballs/0.1.0" }
+]

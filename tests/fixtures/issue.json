@@ -1,0 +1,12 @@
+{
+  "id": 101, "number": 5, "state": "open", "title": "Broken thing",
+  "body": "steps to reproduce",
+  "user": { "login": "alice" },
+  "labels": [ { "id": 3, "name": "bug", "color": "#d73a4a" } ],
+  "assignees": [ { "login": "bob" } ],
+  "milestone": { "id": 2, "title": "v1.1" },
+  "comments": 2,
+  "created_at": "2026-08-01T10:00:00Z",
+  "updated_at": "2026-08-02T11:00:00Z",
+  "html_url": "https://forgejo.test/o/r/issues/5"
+}

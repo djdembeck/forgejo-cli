@@ -1,0 +1,6 @@
+[
+  { "id": 777, "run_id": 123, "attempt": 1, "name": "build", "status": "success",
+    "runs_on": ["ubuntu-latest"] },
+  { "id": 778, "run_id": 123, "attempt": 2, "name": "test", "status": "failure",
+    "runs_on": ["ubuntu-latest"] }
+]

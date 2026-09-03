@@ -1,0 +1,2 @@
+2026-09-01T10:00:00Z INFO  starting build
+2026-09-01T10:00:05Z INFO  build ok

@@ -1,0 +1,6 @@
+[
+  { "number": 9, "state": "open", "draft": false, "title": "Add widget",
+    "user": {"login": "erin"}, "head": {"ref": "feature"}, "base": {"ref": "main"} },
+  { "number": 12, "state": "open", "draft": true, "title": "WIP thing",
+    "user": {"login": "gina"}, "head": {"ref": "wip"}, "base": {"ref": "main"} }
+]

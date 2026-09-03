@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# tests/bin/curl — deterministic fake curl for the fgh regression suite.
+#
+#.Put first on PATH (run.sh does). Every invocation is APPENDED to
+# $FAKE_CURL_LOG (argv, shell-quoted, one line per call) and bodies appended
+# to "$FAKE_CURL_LOG.bodies" (payload lines between ---END-CALL--- markers).
+#
+#.Responses come from sourcing $FAKE_CURL_SCRIPT, which sets STATUS and
+# CONTENT (directly or via the Serve helper). The script sees:
+#
+#   _method   HTTP method fgh passed via -X/--method (default GET)
+#   _url      the final bare-word URL argument (curl semantics)
+#   Serve STATUS CONTENT     shorthand for STATUS=..; CONTENT=..
+#   Serve_file STATUS FILE   content from a file
+#   FAKE_CURL_LOG            read it to branch on prior call count
+#
+# CONTENT may be literal text or a Read of a file (see Read helper).
+
+set -u
+
+: "${FAKE_CURL_LOG:?FAKE_CURL_LOG must be set}"
+: "${FAKE_CURL_SCRIPT:?FAKE_CURL_SCRIPT must be set}"
+
+method="GET"
+data_args=()
+headers=()
+args=("$@")
+url=""
+for ((i=0; i<${#args[@]}; i++)); do
+    a="${args[$i]}"
+    case "$a" in
+        -X|--method)  method="${args[$((i+1))]}"; ((i++)) || true ;;
+        -H)           headers+=("${args[$((i+1))]}"); ((i++)) || true ;;
+        -d|--data|--data-raw|--data-binary|-F|--form|--form-string)
+                      data_args+=("$a" "${args[$((i+1))]}"); ((i++)) || true ;;
+        -o|--output)  ((i++)) || true ;;          # output file arg: skip value
+        -w|--write-out) ((i++)) || true ;;        # format arg: skip value
+        -[a-zA-Z0-9]*) ;;                         # bundled short flags (-sSL)
+        -*)           ((i++)) || true ;;          # unknown long opt: skip value
+        *)            url="$a" ;;
+    esac
+done
+
+# record argv
+q() { printf '%q ' "$@"; }
+printf '%s\n' "$(q "${args[@]}")" >> "$FAKE_CURL_LOG"
+
+# record body (payload of -d/--data; raw field spec of -F)
+body=""
+j=0
+while [ $j -lt ${#data_args[@]} ]; do
+    val="${data_args[$((j+1))]}"
+    body+="$val"$'\n'
+    ((j+=2))
+done
+if [ -n "$body" ]; then
+    printf '%s' "$body" >> "${FAKE_CURL_LOG}.bodies"
+fi
+printf '%s\n' "---END-CALL---" >> "${FAKE_CURL_LOG}.bodies"
+
+# read-only views for response scripts (branching on method/URL)
+_method="$method"
+_url="$url"
+
+# ── serve ──────────────────────────────────────────────────────────────
+STATUS=200
+CONTENT=""
+CONTENT_FILE=""
+Serve() {          # Serve STATUS CONTENT
+    STATUS="$1"; CONTENT="$2"; CONTENT_FILE=""
+}
+Serve_file() {     # Serve_file STATUS FILE
+    STATUS="$1"; CONTENT=""; CONTENT_FILE="$2"
+}
+# shellcheck disable=SC1090
+source "$FAKE_CURL_SCRIPT"
+
+# -w '%{http_code}' consumers read stdout; fgh wants the code FIRST via -w.
+# Emulate: when -w was passed, the "body" seen by fgh is NOT our stdout —
+# curl writes the -w string to stdout after the body. fgh captures the code
+# separately via -o file. So: print the code only when -w '%{http_code}' is in
+# argv semantics, and never print the body to stdout (it went to -o file).
+# api_req uses -o file + -w code; logs/attachment flows use -o file too.
+# fgh's raw api command: out=$(mktemp); code=$(curl ... -o "$out" -w '%{http_code}' ...)
+# So stdout only ever needs the http_code. Body goes where -o pointed.
+write_out=""
+for ((i=0; i<${#args[@]}; i++)); do
+    if [ "${args[$i]}" = "-o" ] || [ "${args[$i]}" = "--output" ]; then
+        write_out="${args[$((i+1))]}"
+    fi
+done
+
+if [ -n "$write_out" ]; then
+    if [ -n "$CONTENT_FILE" ]; then
+        cp "$CONTENT_FILE" "$write_out" 2>/dev/null || true
+    else
+        printf '%s' "$CONTENT" > "$write_out" 2>/dev/null || true
+    fi
+fi
+
+# fgh always reads the code from -w; write it AFTER writing body (curl does
+# the same). fgh captures $(code=$(curl ... -w '%{http_code}')) so the code
+# must be the ONLY stdout content of the fake curl when -w is present.
+has_w=false
+for ((i=0; i<${#args[@]}; i++)); do
+    if [ "${args[$i]}" = "-w" ] || [ "${args[$i]}" = "--write-out" ]; then
+        has_w=true
+    fi
+done
+if [ "$has_w" = true ]; then
+    printf '%s' "$STATUS"
+else
+    # Without -w (e.g. piping), curl streams the body to stdout.
+    if [ -n "$CONTENT_FILE" ]; then cat "$CONTENT_FILE"; else printf '%s' "$CONTENT"; fi
+fi
+exit 0
