@@ -1790,6 +1790,97 @@ cmd_package() {
     esac
 }
 
+# Actions UI URLs use a per-repository run number and a zero-based job
+# position, while the REST detail/log endpoints require database IDs.
+ACTION_RUN_ID=""
+ACTION_RUN_NUMBER=""
+ACTION_JOB_INDEX=""
+ACTION_URL_ATTEMPT=""
+ACTION_RUN_JSON=""
+ACTION_JOB_ID=""
+
+_set_action_url_repo() {
+    local host="$1" slug="$2" expected configured=""
+    require_forgejo_url
+    expected="${FORGEJO_URL#*://}"
+    expected="${expected%%/*}"
+    [[ "$host" == "$expected" ]] || die "Actions URL host '$host' does not match FORGEJO_URL host '$expected'"
+
+    if [[ -n "$REPO_SLUG" ]]; then
+        configured="$REPO_SLUG"
+    elif [[ -n "${FGH_REPO:-}" ]]; then
+        validate_repo_slug "$FGH_REPO" "FGH_REPO"
+        configured="$FGH_REPO"
+    fi
+    if [[ -n "$configured" && "$configured" != "$slug" ]]; then
+        die "Actions URL is for '$slug', but the selected repository is '$configured'; remove -R/FGH_REPO or use the matching repository"
+    fi
+    REPO_SLUG="$slug"
+}
+
+_lookup_action_run_number() {
+    local group="$1" number="$2" response count
+    [[ "$number" =~ ^[0-9]+$ ]] || usage_die "Actions run number must be numeric"
+    response=$(api_get "$group" "$(repo_path)/actions/runs?run_number=${number}&page=1&limit=2")
+    check_fatal
+    count=$(jq '.workflow_runs // [] | length' <<<"$response")
+    (( count == 1 )) || {
+        if (( count == 0 )); then die "no Actions run with UI run number ${number}"; fi
+        die "multiple Actions runs matched UI run number ${number}"
+    }
+    ACTION_RUN_JSON=$(jq -c --argjson n "$number" '.workflow_runs[0] + {run_number:(.workflow_runs[0].run_number // .workflow_runs[0].index_in_repo // $n)}' <<<"$response")
+    ACTION_RUN_ID=$(jq -r '.id' <<<"$ACTION_RUN_JSON")
+    ACTION_RUN_NUMBER="$number"
+}
+
+_resolve_action_run_selector() {
+    local group="$1" selector="$2"
+    local url_re='^https?://([^/]+)/([^/]+)/([^/]+)/actions/runs/([0-9]+)(/jobs/([0-9]+)(/attempt/([0-9]+))?)?(/logs)?/?([?#].*)?$'
+    ACTION_RUN_ID="" ACTION_RUN_NUMBER="" ACTION_JOB_INDEX="" ACTION_URL_ATTEMPT="" ACTION_RUN_JSON=""
+
+    if [[ "$selector" =~ $url_re ]]; then
+        local url_host="${BASH_REMATCH[1]}" url_slug="${BASH_REMATCH[2]}/${BASH_REMATCH[3]}"
+        local url_run="${BASH_REMATCH[4]}" url_job="${BASH_REMATCH[6]:-}" url_attempt="${BASH_REMATCH[8]:-}"
+        _set_action_url_repo "$url_host" "$url_slug"
+        ACTION_RUN_NUMBER="$url_run"
+        ACTION_JOB_INDEX="$url_job"
+        ACTION_URL_ATTEMPT="$url_attempt"
+        _lookup_action_run_number "$group" "$ACTION_RUN_NUMBER"
+    elif [[ "$selector" == run:* ]]; then
+        _lookup_action_run_number "$group" "${selector#run:}"
+    elif [[ "$selector" == id:* ]]; then
+        ACTION_RUN_ID="${selector#id:}"
+        [[ "$ACTION_RUN_ID" =~ ^[0-9]+$ ]] || usage_die "Actions REST run ID must be numeric"
+    elif [[ "$selector" =~ ^[0-9]+$ ]]; then
+        # Backward compatibility: a bare integer is always the REST database ID.
+        ACTION_RUN_ID="$selector"
+    else
+        usage_die "Actions run selector must be a REST ID, run:N, --run-number N, or a Forgejo Actions URL"
+    fi
+}
+
+_resolve_simple_action_run() {
+    local group="$1" usage="$2"; shift 2
+    if [[ "${1:-}" == "--run-number" ]]; then
+        [[ -n "${2:-}" && $# -eq 2 ]] || usage_die "$usage"
+        _resolve_action_run_selector "$group" "run:${2}"
+    else
+        [[ -n "${1:-}" && $# -eq 1 ]] || usage_die "$usage"
+        _resolve_action_run_selector "$group" "$1"
+    fi
+}
+
+_resolve_action_job_index() {
+    local group="$1" run_id="$2" index="$3" jobs count
+    [[ "$index" =~ ^[0-9]+$ ]] || usage_die "Actions UI job index must be numeric"
+    jobs=$(_paginate "$group" "$(repo_path)/actions/runs/${run_id}/jobs")
+    check_fatal
+    jobs=$(jq 'sort_by(.id)' <<<"$jobs")
+    count=$(jq 'length' <<<"$jobs")
+    (( index < count )) || die "job index ${index} out of range: run has ${count} jobs"
+    ACTION_JOB_ID=$(jq -r --argjson i "$index" '.[$i].id' <<<"$jobs")
+}
+
 # ══════════════════════════════════════════════════════════════════════
 # actions
 # ══════════════════════════════════════════════════════════════════════
@@ -1799,19 +1890,27 @@ Usage: fgh actions <subcommand>
 
   list      [--status S] [--event E] [--ref R] [--workflow ID] [--run-number N]
             [--limit N] [--json [FIELDS]] [--jq EXPR]
-  view RUN_ID [--json [FIELDS]] [--jq EXPR]
-  jobs RUN_ID [--limit N] [--json [FIELDS]] [--jq EXPR]
-  watch RUN_ID [--timeout SEC] [--interval SEC]     exit 0 success, 1 otherwise
-  logs RUN_ID [--job JOB_ID] [--attempt N] [--follow] [--timeout SEC]
+  view RUN | view --run-number N [--json [FIELDS]] [--jq EXPR]
+  jobs RUN | jobs --run-number N [--limit N] [--json [FIELDS]] [--jq EXPR]
+  watch RUN | watch --run-number N [--timeout SEC] [--interval SEC]
+  logs RUN | logs --run-number N [--job JOB_ID | --job-index N]
+           [--attempt N] [--follow] [--timeout SEC]
   tasks [--status S] [--limit N] [--json [FIELDS]] [--jq EXPR]   task queue
   dispatch WORKFLOW_FILE --ref REF [--input K=V]...
-  cancel RUN_ID | delete RUN_ID
-  artifact list [--run RUN_ID] [--name NAME] | download ID OUTFILE | delete ID
+  cancel RUN | cancel --run-number N
+  delete RUN | delete --run-number N
+  artifact list [--run RUN | --run-number N] [--name NAME]
+           | download ID OUTFILE | delete ID
   secret list | set NAME (value via --body or stdin) | delete NAME
   variable list | set NAME VALUE | delete NAME
   runner list [--visible true|false] [--org ORG] | view RUNNER_ID
          | register --name NAME [--description TEXT] [--ephemeral]
          | jobs [--labels A,B] | token | delete RUNNER_ID
+
+RUN is a REST database ID, `run:N`, `--run-number N`, or a full Forgejo
+Actions run/job URL. In a UI URL, runs/N is the per-repo run number,
+jobs/J is a zero-based index in the run's ID-sorted jobs, and attempt/A is
+one-based. A bare integer remains a REST ID; never strip a UI URL to its number.
 
 Forgejo 16.0.3 exposes no rerun API — fgh intentionally has no rerun command.
 EOF
@@ -1850,65 +1949,72 @@ cmd_actions() {
             local combined
             combined=$(_paginate_unwrap "$group" "${rp}/actions/runs" "$q")
             check_fatal
+            combined=$(jq 'map(. + {run_number:(.run_number // .index_in_repo)})' <<<"$combined")
             if structured_output <<<"$combined"; then return 0; fi
             if [[ "$(jq 'length' <<<"$combined")" -eq 0 ]]; then echo "No workflow runs."; return 0; fi
             jq -r --arg sep "$(_tab)" '.[] |
-                [(.id|tostring), (.status // "-"), (.event // "-"),
+                [((.index_in_repo // .run_number // "-")|tostring), (.id|tostring),
+                 (.status // "-"), (.event // "-"),
                  (.prettyref // .head_branch // "-"),
-                 ((.head_sha // "-")[:7]),
+                 ((.head_sha // .commit_sha // "-")[:7]),
                  ((.started // .run_started_at // .created // "-")[:19]),
                  (.title // "-")] | join($sep)' \
-                <<<"$combined" | { echo -e "#\tSTATUS\tEVENT\tREF\tCOMMIT\tSTARTED\tTITLE"; cat; } \
+                <<<"$combined" | { echo -e "RUN#\tID\tSTATUS\tEVENT\tREF\tCOMMIT\tSTARTED\tTITLE"; cat; } \
                 | column -t -s "$(printf '\t')"
             ;;
         view)
-            [[ -n "${1:-}" ]] || usage_die "actions view RUN_ID"
-            local run jobs
-            run=$(api_get "$group" "$(repo_path)/actions/runs/${1}")
+            _resolve_simple_action_run "$group" "actions view RUN | actions view --run-number N" "$@"
+            local run_id="$ACTION_RUN_ID" run jobs
+            if [[ -n "$ACTION_RUN_JSON" ]]; then run="$ACTION_RUN_JSON"; else run=$(api_get "$group" "$(repo_path)/actions/runs/${run_id}"); fi
             check_fatal
             if structured_output <<<"$run"; then return 0; fi
-            jobs=$(api_get "$group" "$(repo_path)/actions/runs/${1}/jobs")
+            jobs=$(api_get "$group" "$(repo_path)/actions/runs/${run_id}/jobs")
             check_fatal
             jq -r --argjson jobs "$jobs" '
-                "Run #\(.id)  [\(.status // "-")]  \(.title // "-")",
-                "",
+                "Run #\(.index_in_repo // .run_number // .id)  [\(.status // "-")]  \(.title // "-")",
+                "REST ID:  \(.id)",
                 "Event:    \(.event // "-")",
                 "Ref:      \(.prettyref // .head_branch // "-")",
-                "Commit:   \((.head_sha // "-")[:7])",
+                "Commit:   \((.head_sha // .commit_sha // "-")[:7])",
                 "Started:  \(.started // .run_started_at // "-")",
                 "Stopped:  \(.stopped // "-")",
                 "Trigger:  \(.trigger_user.login // "-")",
                 "URL:      \(.html_url // "-")",
                 "",
-                "Jobs:",
+                "Jobs (UI index / REST ID):",
                 (if ($jobs|length) == 0 then "  (none)"
-                 else $jobs[] | "  #\(.id)  [\(.status)] \(.name)  (attempt \(.attempt // 1))" end)' <<<"$run"
+                 else $jobs | to_entries[] | "  \(.key) / #\(.value.id)  [\(.value.status)] \(.value.name)  (attempt \(.value.attempt // 1))" end)' <<<"$run"
             ;;
         jobs)
-            [[ -n "${1:-}" ]] || usage_die "actions jobs RUN_ID"
-            local run_id="$1"; shift || true
-            local data
+            _resolve_simple_action_run "$group" "actions jobs RUN | actions jobs --run-number N" "$@"
+            local run_id="$ACTION_RUN_ID" data
             data=$(_paginate "$group" "$(repo_path)/actions/runs/${run_id}/jobs")
             check_fatal
+            data=$(jq 'sort_by(.id) | to_entries | map(.value + {job_index:.key})' <<<"$data")
             if structured_output <<<"$data"; then return 0; fi
             if [[ "$(jq 'length' <<<"$data")" -eq 0 ]]; then echo "No jobs."; return 0; fi
             jq -r --arg sep "$(_tab)" '.[] |
-                [(.id|tostring), (.name // "-"), (.status // "-"),
+                [(.job_index|tostring), (.id|tostring), (.name // "-"), (.status // "-"),
                  ((.runs_on // []) | join(",")), ((.attempt // 1)|tostring)] | join($sep)' \
-                <<<"$data" | { echo -e "ID\tNAME\tSTATUS\tRUNS-ON\tATTEMPT"; cat; } | column -t -s "$(printf '\t')"
+                <<<"$data" | { echo -e "INDEX\tID\tNAME\tSTATUS\tRUNS-ON\tATTEMPT"; cat; } | column -t -s "$(printf '\t')"
             ;;
         watch)
-            [[ -n "${1:-}" ]] || usage_die "actions watch RUN_ID [--timeout SEC] [--interval SEC]"
-            local run_id="$1"; shift || true
-            local timeout="" interval=5 args=(); [[ $# -gt 0 ]] && args=("$@")
+            local selector="" run_number="" timeout="" interval=5 args=(); [[ $# -gt 0 ]] && args=("$@")
             local i=0
             while (( i < ${#args[@]} )); do
                 case "${args[$i]}" in
+                    --run-number) run_number="${args[$((i+1))]:-}"; (( i += 2 )) ;;
                     --timeout) [[ "${args[$((i+1))]:-}" =~ ^[0-9]+$ ]] || usage_die "watch --timeout SEC"; timeout="${args[$((i+1))]}"; (( i += 2 )) ;;
                     --interval) [[ "${args[$((i+1))]:-}" =~ ^[0-9]+$ ]] || usage_die "watch --interval SEC"; interval="${args[$((i+1))]}"; (( i += 2 )) ;;
-                    *) usage_die "actions watch: unknown argument '${args[$i]}'" ;;
+                    -*) usage_die "actions watch: unknown argument '${args[$i]}'" ;;
+                    *) [[ -z "$selector" ]] || usage_die "actions watch accepts one run selector"; selector="${args[$i]}"; (( i += 1 )) ;;
                 esac
             done
+            [[ -z "$selector" || -z "$run_number" ]] || usage_die "actions watch: use a run selector or --run-number, not both"
+            if [[ -n "$run_number" ]]; then selector="run:${run_number}"; fi
+            [[ -n "$selector" ]] || usage_die "actions watch RUN | actions watch --run-number N"
+            _resolve_action_run_selector "$group" "$selector"
+            local run_id="$ACTION_RUN_ID"
             rp=$(repo_path)
             local deadline=0
             [[ -n "$timeout" ]] && deadline=$(( $(date +%s) + timeout ))
@@ -1946,20 +2052,42 @@ cmd_actions() {
             #   GET /actions/runs/{id}/logs   → ZIP archive of per-job .log files
             #   GET /actions/jobs/{id}/logs   → plaintext (supports ?attempt=N and
             #                                   Range requests for --follow)
-            [[ -n "${1:-}" ]] || usage_die "actions logs RUN_ID [--job JOB_ID] [--attempt N] [--follow] [--timeout SEC]"
-            local run_id="$1"; shift || true
-            local job_id="" attempt="" follow=false log_timeout="" args=()
+            local selector="" run_number="" job_id="" job_index="" attempt="" follow=false log_timeout="" args=()
             [[ $# -gt 0 ]] && args=("$@")
             local i=0
             while (( i < ${#args[@]} )); do
                 case "${args[$i]}" in
+                    --run-number) run_number="${args[$((i+1))]:-}"; (( i += 2 )) ;;
                     --job|-j) job_id="${args[$((i+1))]:-}"; (( i += 2 )) ;;
+                    --job-index) job_index="${args[$((i+1))]:-}"; (( i += 2 )) ;;
                     --attempt) attempt="${args[$((i+1))]:-}"; (( i += 2 )) ;;
                     --follow|-f) follow=true; (( i += 1 )) ;;
                     --timeout) [[ "${args[$((i+1))]:-}" =~ ^[0-9]+$ ]] || usage_die "logs --timeout SEC"; log_timeout="${args[$((i+1))]}"; (( i += 2 )) ;;
-                    *) usage_die "actions logs: unknown argument '${args[$i]}'" ;;
+                    -*) usage_die "actions logs: unknown argument '${args[$i]}'" ;;
+                    *) [[ -z "$selector" ]] || usage_die "actions logs accepts one run selector"; selector="${args[$i]}"; (( i += 1 )) ;;
                 esac
             done
+            [[ -z "$selector" || -z "$run_number" ]] || usage_die "actions logs: use a run selector or --run-number, not both"
+            [[ -z "$job_id" || -z "$job_index" ]] || usage_die "actions logs: use --job or --job-index, not both"
+            if [[ -n "$run_number" ]]; then selector="run:${run_number}"; fi
+            [[ -n "$selector" ]] || usage_die "actions logs RUN | actions logs --run-number N"
+            _resolve_action_run_selector "$group" "$selector"
+            local run_id="$ACTION_RUN_ID"
+            if [[ -n "$ACTION_JOB_INDEX" ]]; then
+                [[ -z "$job_id$job_index" ]] || usage_die "job URL already selects a job; omit --job/--job-index"
+                job_index="$ACTION_JOB_INDEX"
+            fi
+            if [[ -n "$ACTION_URL_ATTEMPT" ]]; then
+                [[ -z "$attempt" || "$attempt" == "$ACTION_URL_ATTEMPT" ]] || usage_die "URL attempt conflicts with --attempt"
+                attempt="$ACTION_URL_ATTEMPT"
+            fi
+            if [[ -n "$job_index" ]]; then
+                _resolve_action_job_index "$group" "$run_id" "$job_index"
+                job_id="$ACTION_JOB_ID"
+            elif [[ -n "$job_id" ]]; then
+                [[ "$job_id" =~ ^[0-9]+$ ]] || usage_die "--job requires a REST job ID; use --job-index N or pass the full UI job URL as RUN"
+            fi
+            if [[ -n "$attempt" ]]; then [[ "$attempt" =~ ^[1-9][0-9]*$ ]] || usage_die "--attempt must be a positive integer"; fi
             rp=$(repo_path)
             prepare_curl_auth "$group"
             local base="${FORGEJO_URL%/}/api/v1/${rp}/actions"
@@ -2079,33 +2207,40 @@ cmd_actions() {
             echo "Dispatched ${workflow} on ${ref}"
             ;;
         cancel)
-            [[ -n "${1:-}" ]] || usage_die "actions cancel RUN_ID"
-            _no_flags "actions cancel" "${@:2}"
-            api_send "$group" POST "$(repo_path)/actions/runs/${1}/cancel" "" >/dev/null
-            echo "Cancelled run #${1}"
+            _resolve_simple_action_run "$group" "actions cancel RUN | actions cancel --run-number N" "$@"
+            local run_id="$ACTION_RUN_ID"
+            api_send "$group" POST "$(repo_path)/actions/runs/${run_id}/cancel" "" >/dev/null
+            echo "Cancelled run #${ACTION_RUN_NUMBER:-$run_id} (REST ID ${run_id})"
             ;;
         delete)
-            [[ -n "${1:-}" ]] || usage_die "actions delete RUN_ID"
-            _no_flags "actions delete" "${@:2}"
-            api_send "$group" DELETE "$(repo_path)/actions/runs/${1}" >/dev/null
-            echo "Deleted run #${1}"
+            _resolve_simple_action_run "$group" "actions delete RUN | actions delete --run-number N" "$@"
+            local run_id="$ACTION_RUN_ID"
+            api_send "$group" DELETE "$(repo_path)/actions/runs/${run_id}" >/dev/null
+            echo "Deleted run #${ACTION_RUN_NUMBER:-$run_id} (REST ID ${run_id})"
             ;;
         artifact)
             local asub="${1:-list}"; shift || true
             case "$asub" in
                 list)
-                    local run_id="" name="" args=()
+                    local run_selector="" run_number="" run_id="" name="" args=()
                     [[ $# -gt 0 ]] && args=("$@")
                     local i=0
                     while (( i < ${#args[@]} )); do
                         _common_opt "${args[$i]}" "${args[$((i+1))]:-}"
                         if (( OPT_VALUE > 0 )); then i=$(( i + OPT_VALUE )); continue; fi
                         case "${args[$i]}" in
-                            --run) run_id="${args[$((i+1))]:-}"; (( i += 2 )) ;;
+                            --run) run_selector="${args[$((i+1))]:-}"; (( i += 2 )) ;;
+                            --run-number) run_number="${args[$((i+1))]:-}"; (( i += 2 )) ;;
                             --name) name="${args[$((i+1))]:-}"; (( i += 2 )) ;;
                             *) usage_die "actions artifact list: unknown argument '${args[$i]}'" ;;
                         esac
                     done
+                    [[ -z "$run_selector" || -z "$run_number" ]] || usage_die "artifact list: use --run or --run-number, not both"
+                    if [[ -n "$run_number" ]]; then run_selector="run:${run_number}"; fi
+                    if [[ -n "$run_selector" ]]; then
+                        _resolve_action_run_selector "$group" "$run_selector"
+                        run_id="$ACTION_RUN_ID"
+                    fi
                     rp=$(repo_path)
                     local q=""
                     [[ -n "$name" ]] && q+="&name=$(urlencode "$name")"
@@ -2718,7 +2853,7 @@ main() {
     # through to the dispatch ('Unknown command: X' + help, exit 1) below
     # regardless of repo availability, never be masked by a repo error.
     case "$cmd" in
-        issue|label|milestone|pr|release|package|actions|repo) resolve_repo >/dev/null ;;
+        issue|label|milestone|pr|release|package|repo) resolve_repo >/dev/null ;;
     esac
     case "$cmd" in
         help|--help|-h) print_help ;;

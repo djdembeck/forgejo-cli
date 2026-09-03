@@ -78,11 +78,11 @@ fgh pr view 17
 fgh pr checks 17
 fgh pr merge 17 --squash --delete-branch
 
-# Watch a run and fetch logs.
-fgh actions list --limit 5
-fgh actions watch 1983
-fgh actions logs 1983                     # run archive, printed as text
-fgh actions logs 1983 --job 4620          # canonical plaintext job log
+# Watch a UI run number and fetch its logs.
+fgh actions list --limit 5               # shows RUN# and REST ID
+fgh actions watch --run-number 157
+fgh actions logs --run-number 157
+fgh actions logs --run-number 157 --job-index 3 --attempt 1
 ```
 
 ### JSON and JQ output
@@ -194,25 +194,30 @@ fgh package delete container myimage 1.2.3     # TYPE NAME VERSION
 
 ### Actions
 
-`fgh actions` covers Forgejo 16.0 workflow runs, jobs, logs, the task queue, dispatch, artifacts, secrets, variables, and runners:
+`fgh actions` covers Forgejo 16.0 workflow runs, jobs, logs, the task queue, dispatch, artifacts, secrets, variables, and runners.
+
+Forgejo uses different identifiers in its UI and REST API. In a UI URL such as `.../actions/runs/157/jobs/3/attempt/1`, `157` is the per-repository run number, `3` is a zero-based position in the run's ID-sorted jobs, and `1` is the one-based attempt. REST detail/log endpoints require database IDs instead. A bare integer passed to `fgh` remains a REST ID for compatibility; use `--run-number N`, `run:N`, or the complete UI URL when starting from Forgejo's UI. Full URLs are resolved to the correct repository, run ID, job ID, and attempt.
 
 ```bash
 fgh actions list [--status S] [--event E] [--ref R] [--workflow ID] [--run-number N]
-fgh actions view 1983                     # run details + jobs
-fgh actions jobs 1983                     # job table (id, status, runs-on, attempt)
-fgh actions watch 1983 [--timeout SEC] [--interval SEC]
+fgh actions view 3493                     # REST database ID
+fgh actions view --run-number 157         # UI run number
+fgh actions view 'https://forgejo.example/o/r/actions/runs/157'
+fgh actions jobs --run-number 157         # shows UI INDEX and REST ID
+fgh actions watch --run-number 157 [--timeout SEC] [--interval SEC]
 fgh actions tasks [--status queued]       # task queue listing
 
-fgh actions logs 1983                     # run logs: ZIP, safely printed as text
-fgh actions logs 1983 --job 4620          # canonical plaintext job log
-fgh actions logs 1983 --job 4620 --attempt 2
-fgh actions logs 1983 --job 4620 --follow [--timeout SEC]
+fgh actions logs --run-number 157         # complete run logs
+fgh actions logs 3493 --job 8542          # REST run/job IDs
+fgh actions logs --run-number 157 --job-index 3 --attempt 1
+fgh actions logs 'https://forgejo.example/o/r/actions/runs/157/jobs/3/attempt/1'
+fgh actions logs 3493 --job 8542 --follow [--timeout SEC]
 
 fgh actions dispatch deploy.yml --ref main --input region=eu-west-1
-fgh actions cancel 1983
-fgh actions delete 1983
+fgh actions cancel --run-number 157
+fgh actions delete 3493                   # REST ID
 
-fgh actions artifact list [--run 1983] [--name NAME]
+fgh actions artifact list --run-number 157 [--name NAME]
 fgh actions artifact download 496 out.zip
 fgh actions artifact delete 496
 
@@ -232,7 +237,7 @@ fgh actions runner token                  # deprecated compatibility endpoint
 fgh actions runner delete 3
 ```
 
-Log mechanics in Forgejo 16.0.3: `actions logs RUN` downloads the run's log ZIP and prints each `.log` member (named `{job-name}-{job-id}-attempt-{N}.log`) with `unzip -p` — never binary. `--job JOB_ID` fetches the canonical plaintext job log instead; `--attempt N` selects a historical attempt. `--follow` **requires a job ID** (run archives are static) and polls the job log with `Range: bytes=offset-` requests, printing exactly the new bytes and never duplicating output; it exits 0 when the job succeeds, 1 otherwise (use `--timeout` to bound the wait).
+Log mechanics in Forgejo 16.0.3: `actions logs RUN` downloads the run's log ZIP and prints each `.log` member (named `{job-name}-{job-id}-attempt-{N}.log`) with `unzip -p` — never binary. `--job JOB_ID` accepts only a REST database job ID. Use `--job-index N` with a run selector for a UI job position, or pass the complete UI job URL; a URL ending in `/attempt/N` supplies the attempt automatically. `--follow` requires a selected job and polls with `Range: bytes=offset-`, printing only new bytes; it exits 0 when the job succeeds and 1 otherwise.
 
 ### Repository
 
