@@ -88,17 +88,18 @@ assert_method_call() {
 }
 
 # assert_auth_token NAME CALL_N EXPECTED_TOKEN — Authorization header carried token.
-# Log lines are shell-quoted (printf %q), so we match the unescaped token value
-# plus the Authorization header word rather than the exact spaced phrase.
+# Since FIX 6 the token is passed to curl via `-H @file` (never in argv), so
+# the header line is checked from the fake curl's expanded-header records
+# (Log_headers), which mirror what real curl would have put on the wire.
 assert_auth_token() {
-    local line; line="$(Log_line "$2")"
-    if printf '%s' "$line" | grep -q 'Authorization' && printf '%s' "$line" | grep -qF -- "$3"; then
+    local hdr; hdr="$(Log_headers "$2")"
+    if printf '%s' "$hdr" | grep -q 'Authorization' && printf '%s' "$hdr" | grep -qF -- "$3"; then
         PASS=$((PASS+1))
     else
         FAIL=$((FAIL+1))
         FAILED_TESTS="${FAILED_TESTS}${FAILED_TESTS:+, }$1"
-        printf 'FAIL %s\n  expected Authorization header with token %s\n  argv: %s\n' \
-            "$1" "$3" "$(printf '%s' "$line" | head -c 160)" >&2
+        printf 'FAIL %s\n  expected Authorization header with token %s\n  headers: %s\n' \
+            "$1" "$3" "$(printf '%s' "$hdr" | head -c 160)" >&2
     fi
 }
 
@@ -110,4 +111,5 @@ assert_auth_token() {
 reset_log() {
     : > "$FAKE_CURL_LOG"
     : > "${FAKE_CURL_LOG}.bodies"
+    : > "${FAKE_CURL_LOG}.hdrs"
 }

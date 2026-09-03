@@ -41,9 +41,37 @@ for ((i=0; i<${#args[@]}; i++)); do
     esac
 done
 
+# fgh passes the Authorization header as `curl -H @FILE` (token kept out of
+# argv). Expand @file headers so response scripts and headers[] see the
+# real "Authorization: token ..." line, exactly as curl would.
+real_headers=()
+for ((i=0; i<${#headers[@]}; i++)); do
+    h="${headers[$i]}"
+    if [[ "$h" == @* ]]; then
+        hf="${h#@}"
+        if [ -r "$hf" ]; then
+            while IFS= read -r line; do
+                [ -z "$line" ] && continue
+                real_headers+=("$line")
+            done < "$hf"
+        else
+            echo "fake-curl: header file not readable: $hf" >&2
+            exit 26
+        fi
+    else
+        real_headers+=("$h")
+    fi
+done
+headers=("${real_headers[@]}")
+
 # record argv
 q() { printf '%q ' "$@"; }
 printf '%s\n' "$(q "${args[@]}")" >> "$FAKE_CURL_LOG"
+# record EXPANDED headers (post-@file) to a side file, one call per
+# ---END-HDRS--- group. Keeping FAKE_CURL_LOG byte-identical to the old
+# argv-only format lets response scripts keep counting calls with wc -l.
+for ((_h=0; _h<${#headers[@]}; _h++)); do printf 'HDR %s\n' "${headers[$_h]}"; done >> "$FAKE_CURL_LOG.hdrs"
+printf '%s\n' "---END-HDRS---" >> "$FAKE_CURL_LOG.hdrs"
 
 # record body (payload of -d/--data; raw field spec of -F)
 body=""
@@ -58,9 +86,12 @@ if [ -n "$body" ]; then
 fi
 printf '%s\n' "---END-CALL---" >> "${FAKE_CURL_LOG}.bodies"
 
-# read-only views for response scripts (branching on method/URL)
+# read-only views for response scripts (branching on method/URL/method+headers)
 _method="$method"
 _url="$url"
+# headers=(...) are curl semantics after @file expansion; scripts can
+# grep them for the Authorization line.
+_headers_line="$(printf '%s\n' "${headers[@]}" 2>/dev/null || true)"
 
 # ── serve ──────────────────────────────────────────────────────────────
 STATUS=200

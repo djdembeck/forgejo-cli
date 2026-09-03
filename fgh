@@ -20,8 +20,22 @@ OPT_JQ=""       # --jq EXPR (implies JSON)
 OPT_LIMIT=""
 OPT_VALUE=""    # output slot for _opt helpers
 
-_FATAL_MARK="${TMPDIR:-/tmp}/fgh-fatal.$$"
-trap 'rm -f "$_FATAL_MARK"' EXIT
+# ── private temp dir ─────────────────────────────────────────────────
+# One securely-created (0700) directory per process holds all fgh temp
+# state: the fatal marker and (FIX 6) the curl Authorization header file.
+# mktemp -d never collides and cannot be pre-created by an attacker, so a
+# symlink planted at a predictable path cannot redirect the truncation of
+# the fatal marker.
+_FGH_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/fgh.XXXXXX")"
+_FGH_AUTH_FILE="$_FGH_TMPDIR/auth-header"
+_FATAL_MARK="$_FGH_TMPDIR/fatal"
+# Cleanup on every exit path (success, die, usage_die, check_fatal). The
+# EXIT trap is inherited by the $( ) subshells api_req callers create; a
+# subshell ($BASHPID != $$) must POTENTIALLY leave the fatal marker in
+# place for check_fatal() while never deleting the shared directory, so
+# only the main shell removes the tree. There is no race: subshells exit
+# before the main shell does.
+trap '[[ $BASHPID == $$ ]] && rm -rf "$_FGH_TMPDIR"' EXIT
 
 die() {
     echo "Error: $*" >&2
@@ -54,8 +68,9 @@ json_array() {
 REPO_SLUG=""
 
 resolve_repo() {
-    if [[ -n "$REPO_SLUG" ]]; then printf '%s\n' "$REPO_SLUG"; return; fi
+    if [[ -n "$REPO_SLUG" ]]; then validate_repo_slug "$REPO_SLUG" "<-R/--repo or FGH_REPO>"; printf '%s\n' "$REPO_SLUG"; return; fi
     if [[ -n "${FGH_REPO:-}" ]]; then
+        validate_repo_slug "$FGH_REPO" "FGH_REPO"
         REPO_SLUG="${FGH_REPO%%/*}/${FGH_REPO#*/}"
         printf '%s\n' "$REPO_SLUG"; return
     fi
@@ -69,8 +84,20 @@ resolve_repo() {
         -e 's|^https?://||' \
         -e 's|^[^/]+(:[0-9]+)?/(.*/.+)$|\2|')
     [[ "$url" == */* && "$url" != */*/* ]] || die "could not derive owner/repo from remote '$remote'; use -R owner/repo"
+    validate_repo_slug "$url" "git remote" || {
+        die "could not derive owner/repo from remote '$remote'; use -R owner/repo"
+    }
     REPO_SLUG="$url"
     printf '%s\n' "$REPO_SLUG"
+}
+
+# validate_repo_slug VALUE SOURCE — every preconfigured slug (-R/--repo,
+# FGH_REPO) must be exactly two nonempty owner/repo segments. Called from
+# resolve_repo, i.e. before any API path is built. Git-remote-derived slugs
+# are pre-filtered by the caller and only re-checked defensively.
+validate_repo_slug() {
+    local slug="$1" source="${2:-value}"
+    [[ "$slug" =~ ^[^/]+/[^/]+$ ]] || usage_die "invalid repository '${slug}' (from ${source}): expected exactly owner/repo, two nonempty segments"
 }
 
 # die() inside the $( ) subshell below would only kill the subshell; the
@@ -120,18 +147,32 @@ check_fatal() {
     fi
 }
 
+# prepare_curl_auth GROUP — shared prelude for every raw-curl site (api_req,
+# api_multipart, actions logs/artifact download, fgh api): select the group's
+# token, write the Authorization header file (token never appears in argv;
+# /proc/<pid>/cmdline is world-readable while curl runs), chmod 600 inside
+# the 0700 private temp dir, and verify FORGEJO_URL. TOKEN is set as a
+# global — group→token mapping lives only in select_token; this is the one
+# place the header file gets written.
+prepare_curl_auth() {
+    TOKEN=$(select_token "$1")
+    printf 'Authorization: token %s\n' "$TOKEN" > "$_FGH_AUTH_FILE"
+    chmod 600 "$_FGH_AUTH_FILE"
+    require_forgejo_url
+}
+
 api_req() {
     local group="$1" method="$2" path="$3"
     shift 3
-    TOKEN=$(select_token "$group")
+    prepare_curl_auth "$group"
     local url="${FORGEJO_URL%/}/api/v1/${path#/}"
-    HTTP_BODY_FILE=$(mktemp "${TMPDIR:-/tmp}/fgh.XXXXXX")
+    HTTP_BODY_FILE=$(mktemp "$_FGH_TMPDIR/fgh.XXXXXX")
     local err="${HTTP_BODY_FILE}.err" code rc=0
     set +e
     code=$(curl -sS -o "$HTTP_BODY_FILE" -w '%{http_code}' \
         -X "$method" \
-        -H "Authorization: token ${TOKEN}" \
         -H "Accept: application/json" \
+        -H "@$_FGH_AUTH_FILE" \
         "$@" "$url" 2>"$err")
     rc=$?
     set -e
@@ -168,6 +209,16 @@ _response_body() {
     HTTP_BODY_FILE=""
 }
 
+# require_forgejo_url — every API call needs an explicit instance URL.	env
+# substitution masks typos like FORGEJO_URL=http:/host (single slash), so an
+# unset/empty value is a hard error, not a curl call to /api/v1/....  It also
+# avoids a bash unbound-variable crash under `set -u` on the offline path.
+require_forgejo_url() {
+    if [[ -z "${FORGEJO_URL:-}" ]]; then
+        die "FORGEJO_URL is not set: export FORGEJO_URL=https://<forgejo-host> (or use --url)"
+    fi
+}
+
 # api_get GROUP PATH [curl args...] — prints the JSON response body
 api_get() {
     local group="$1" path="$2"; shift 2
@@ -188,36 +239,52 @@ api_send() {
 }
 
 # curl must run its own request for multipart bodies; API_PATH already query-encoded
+# Failure contract matches api_req: callers run in the main shell (upload sites)
+# where _api_fatal's exit 1 applies directly; running inside $( ) the planted
+# marker is caught by the caller's check_fatal. HTTP_ALLOW_ERROR=true keeps the
+# non-2xx body available via _response_body instead of failing.
 api_multipart() {
     local group="$1" path="$2" file="$3" form_field="${4:-attachment}"
-    TOKEN=$(select_token "$group")
+    prepare_curl_auth "$group"
     local url="${FORGEJO_URL%/}/api/v1/${path#/}"
-    HTTP_BODY_FILE=$(mktemp "${TMPDIR:-/tmp}/fgh.XXXXXX")
+    HTTP_BODY_FILE=$(mktemp "$_FGH_TMPDIR/fgh.XXXXXX")
     local err="${HTTP_BODY_FILE}.err" code rc=0
     set +e
     code=$(curl -sS -o "$HTTP_BODY_FILE" -w '%{http_code}' \
         -X POST \
-        -H "Authorization: token ${TOKEN}" \
+        -H "@$_FGH_AUTH_FILE" \
         -F "${form_field}=@${file}" \
         "$url" 2>"$err")
     rc=$?
     set -e
-    if (( rc != 0 )); then cat "$err" >&2 2>/dev/null || true; rm -rf "$HTTP_BODY_FILE" "$err"; die "upload failed"; fi
+    if (( rc != 0 )); then
+        cat "$err" >&2 2>/dev/null || true
+        rm -rf "$HTTP_BODY_FILE" "$err"
+        echo "Error: upload failed contacting $url" >&2
+        _api_fatal
+    fi
     rm -f "$err"
     case "$code" in 2*) HTTP_CODE="$code" ;; *)
+        HTTP_CODE="$code"
+        if [[ "$HTTP_ALLOW_ERROR" == true ]]; then return 0; fi
         local body; body=$(cat "$HTTP_BODY_FILE" 2>/dev/null || true)
         echo "Error: HTTP $code uploading $(basename "$file"): $body" >&2
         rm -f "$HTTP_BODY_FILE"; HTTP_BODY_FILE=""
-        exit 1 ;;
-    esac
+        _api_fatal
+    ;; esac
 }
 
 # ── pagination ───────────────────────────────────────────────────────
-# _paginate GROUP BASE_PATH QUERY...
+# _paginate GROUP BASE_PATH [QUERY...]
 # Walks ?page=&limit= pages; BASE_PATH must not already contain '?'.
 # Honors OPT_LIMIT; prints one combined JSON array.
-_paginate() {
-    local group="$1" base="$2"; shift 2
+# _paginate_unwrap GROUP BASE_PATH [QUERY...]
+# Same walk for envelope responses ({total_count, workflow_runs}): each
+# page is unwrapped with '.workflow_runs // []' before counting, so the
+# combined output is the bare array. Same limit/last-page semantics.
+# The shared walk lives in _paginate_core; UNWRAP is the per-page jq filter.
+_paginate_core() {
+    local group="$1" base="$2" unwrap="$3"; shift 3
     local page=1 count batch combined="[]" sep="?"
     local remaining="" fetch
     [[ "$base" == *\?* ]] && sep="&"
@@ -228,7 +295,7 @@ _paginate() {
             fetch=$(( remaining < PAGE_MAX ? remaining : PAGE_MAX ))
             (( fetch == 0 )) && break
         fi
-        batch=$(api_get "$group" "${base}${sep}page=${page}&limit=${fetch}$*")
+        batch=$(api_get "$group" "${base}${sep}page=${page}&limit=${fetch}$*" | jq "$unwrap")
         count=$(jq 'length' <<<"$batch")
         if (( count == 0 )); then break; fi
         if [[ -n "$remaining" ]] && (( remaining <= count )); then
@@ -245,6 +312,9 @@ _paginate() {
     done
     printf '%s' "$combined"
 }
+
+_paginate() { _paginate_core "$1" "$2" '.' "${@:3}"; }
+_paginate_unwrap() { _paginate_core "$1" "$2" '.workflow_runs // []' "${@:3}"; }
 
 # ── structured output ────────────────────────────────────────────────
 # jq object construction from a comma-separated field list. Field names are
@@ -503,44 +573,50 @@ cmd_issue() {
             [[ -n "${1:-}" ]] || usage_die "issue edit ISSUE_NUMBER"
             local num="$1"; shift || true
             local title="" body="" state="" milestone_id=""
+            local title_set=false body_set=false milestone_set=false
             local -a assignees=() label_ops=() args=()
             [[ $# -gt 0 ]] && args=("$@")
             local i=0
             while (( i < ${#args[@]} )); do
                 case "${args[$i]}" in
-                    --title) title="${args[$((i+1))]:-}"; (( i += 2 )) ;;
-                    --body) body="${args[$((i+1))]:-}"; (( i += 2 )) ;;
+                    --title) title="${args[$((i+1))]:-}"; title_set=true; (( i += 2 )) ;;
+                    --body) body="${args[$((i+1))]:-}"; body_set=true; (( i += 2 )) ;;
                     --body-file)
                         [[ -n "${args[$((i+1))]:-}" ]] || usage_die "edit --body-file FILE|-"
                         if [[ "${args[$((i+1))]}" == "-" ]]; then body=$(cat); else body=$(cat "${args[$((i+1))]}"); fi
-                        (( i += 2 )) ;;
+                        body_set=true; (( i += 2 )) ;;
                     --state) case "${args[$((i+1))]:-}" in open|closed) state="${args[$((i+1))]}"; (( i += 2 )) ;;
                         *) usage_die "edit --state open|closed" ;; esac ;;
                     --assignee) [[ -n "${args[$((i+1))]:-}" ]] || usage_die "edit --assignee USER"; assignees+=("${args[$((i+1))]}"); (( i += 2 )) ;;
                     --label) [[ -n "${args[$((i+1))]:-}" ]] || usage_die "edit --label NAME"; label_ops+=("${args[$((i+1))]}"); (( i += 2 )) ;;
-                    --milestone) milestone_id="${args[$((i+1))]:-}"; (( i += 2 )) ;;
+                    --milestone) milestone_id="${args[$((i+1))]:-}"; milestone_set=true; (( i += 2 )) ;;
                     --json|--jq) _common_opt "${args[$i]}" "${args[$((i+1))]:-}"; i=$(( i + OPT_VALUE )) ;;
                     *) usage_die "issue edit: unknown argument '${args[$i]}'" ;;
                 esac
             done
-            if [[ -z "$title$body$state$milestone_id" && ${#assignees[@]} -eq 0 && ${#label_ops[@]} -eq 0 ]]; then
+            if [[ "$title_set" == false && "$body_set" == false && -z "$state" && "$milestone_set" == false && ${#assignees[@]} -eq 0 && ${#label_ops[@]} -eq 0 ]]; then
                 usage_die "issue edit N: provide --title, --body-file, --state, --assignee, --label, or --milestone"
             fi
             local rp; rp=$(repo_path)
-            if [[ -n "$title$body$state$milestone_id" || ${#assignees[@]} -gt 0 ]]; then
+            if [[ "$title_set" == true || "$body_set" == true || -n "$state$milestone_id" || "$milestone_set" == true || ${#assignees[@]} -gt 0 ]]; then
                 local payload
                 payload=$(jq -n \
                     --arg t "$title" --arg b "$body" --arg s "$state" --arg m "$milestone_id" \
-                    '{title:(if $t=="" then null else $t end),
-                      body:(if $b=="" then null else $b end),
+                    --argjson ts "$title_set" --argjson bs "$body_set" \
+                    '{title:(if $ts then $t elif $t=="" then null else $t end),
+                      body:(if $bs then $b elif $b=="" then null else $b end),
                       state:(if $s=="" then null else $s end),
-                      milestone:(if $m=="" then null else ($m|tonumber) end)}')
+                      milestone:($m|if .=="" then null else tonumber end)}')
+                # Presence beats emptiness: --title '' / --body '' patch the field
+                # with "" (explicit clearing), while never-passed flags stay null
+                # and are dropped. --milestone '' sends explicit null (last step
+                # keeps it) which clears the milestone on the server.
+                payload=$(jq --argjson ms "$milestone_set" '
+                    with_entries(select(.value != null or (.key == "milestone" and $ms)))' <<<"$payload")
                 if (( ${#assignees[@]} > 0 )); then
                     local assignee_values; assignee_values=$(json_array "${assignees[@]}")
                     payload=$(jq --argjson a "$assignee_values" '. + {assignees: $a}' <<<"$payload")
                 fi
-                # Remove null fields so we only patch what changed
-                payload=$(jq 'with_entries(select(.value != null))' <<<"$payload")
                 local updated
                 updated=$(api_send "$group" PATCH "${rp}/issues/${num}" "$payload")
                 check_fatal
@@ -551,23 +627,30 @@ cmd_issue() {
                 # PUT replaces the label set with the union of existing + new.
                 local current="" ids all
                 current=$(api_get "$group" "${rp}/issues/${num}/labels")
+                check_fatal
                 ids=$(resolve_label_ids "$group" "$rp" "${label_ops[@]}")
+                check_fatal
                 all=$(jq -s --argjson new "$ids" '(add // []) | map(.id) + $new | unique' \
                     <(printf '%s' "$current"))
                 api_send "$group" PUT "${rp}/issues/${num}/labels" "$(jq -n --argjson l "$all" '{labels:$l}')" >/dev/null
+                check_fatal
                 echo "Labels updated on issue #$num"
             fi
             ;;
         close)
             [[ -n "${1:-}" ]] || usage_die "issue close N"
+            _no_flags "issue close" "${@:2}"
             local updated
             updated=$(api_send "$group" PATCH "$(repo_path)/issues/${1}" '{"state":"closed"}')
+            check_fatal
             jq -r '"Closed #\(.number): \(.title)"' <<<"$updated"
             ;;
         open)
             [[ -n "${1:-}" ]] || usage_die "issue open N"
+            _no_flags "issue open" "${@:2}"
             local updated
             updated=$(api_send "$group" PATCH "$(repo_path)/issues/${1}" '{"state":"open"}')
+            check_fatal
             jq -r '"Reopened #\(.number): \(.title)"' <<<"$updated"
             ;;
         comments)
@@ -662,7 +745,8 @@ cmd_issue() {
             local uploaded; uploaded=$(_response_body)
             check_fatal
             if structured_output <<<"$uploaded"; then return 0; fi
-            jq -r '"Attached \(.name) (id \(.id))\nEmbed URL: \(.browser_download_url // \"-\")"' <<<"$uploaded"
+            jq -r '"Attached \(.name) (id \(.id))",
+                   "Embed URL: \(.browser_download_url // "-")"' <<<"$uploaded"
             ;;
         comment-attachments)
             [[ -n "${1:-}" ]] || usage_die "issue comment-attachments COMMENT_ID"
@@ -674,6 +758,7 @@ cmd_issue() {
             ;;
         comment-detach)
             [[ -n "${1:-}" && -n "${2:-}" ]] || usage_die "issue comment-detach COMMENT_ID ATTACHMENT_ID"
+            _no_flags "issue comment-detach" "${@:3}"
             api_send "$group" DELETE "$(repo_path)/issues/comments/${1}/assets/${2}" >/dev/null
             echo "Deleted attachment #${2} from comment #${1}"
             ;;
@@ -746,14 +831,18 @@ cmd_label() {
                     --name) name="${args[$((i+1))]:-}"; (( i += 2 )) ;;
                     --color) color="${args[$((i+1))]:-}"; (( i += 2 )) ;;
                     --description|--desc) desc="${args[$((i+1))]:-}"; (( i += 2 )) ;;
-                    --exclusive)
-                        if [[ "${args[$((i+1))]:-}" == "true" || "${args[$((i+1))]:-}" == "false" ]]; then
+                    --exclusive|--exclusive=*|--no-exclusive)
+                        if [[ "${args[$i]}" == --exclusive=* ]]; then
+                            excl_val="${args[$i]#--exclusive=}"; (( i += 1 ))
+                        elif [[ "${args[$((i+1))]:-}" == "true" || "${args[$((i+1))]:-}" == "false" ]]; then
                             excl_val="${args[$((i+1))]}"; (( i += 2 ))
+                        elif [[ "${args[$i]}" == "--no-exclusive" ]]; then
+                            excl_val=false; (( i += 1 ))
                         else
                             excl_val=true; (( i += 1 ))
                         fi
+                        case "$excl_val" in true|false) ;; *) usage_die "label edit --exclusive true|false (got '$excl_val')" ;; esac
                         exclusive_set=true ;;
-                    --no-exclusive) excl_val=false; exclusive_set=true; (( i += 1 )) ;;
                     *) usage_die "label edit: unknown argument '${args[$i]}'" ;;
                 esac
             done
@@ -777,10 +866,12 @@ cmd_label() {
             ;;
         delete)
             [[ -n "${1:-}" ]] || usage_die "label delete LABEL_ID"
+            _no_flags "label delete" "${@:2}"
             api_send "$group" DELETE "$(repo_path)/labels/${1}" >/dev/null
             echo "Deleted label #${1}"
             ;;
         ensure)
+            _no_flags "label ensure" "$@"
             local -A std_labels=(
                 [bug]="d73a4a|Something isn't working"
                 [enhancement]="84b6eb|New feature or request"
@@ -902,6 +993,7 @@ cmd_milestone() {
             ;;
         delete)
             [[ -n "${1:-}" ]] || usage_die "milestone delete ID"
+            _no_flags "milestone delete" "${@:2}"
             api_send "$group" DELETE "$(repo_path)/milestones/${1}" >/dev/null
             echo "Deleted milestone #${1}"
             ;;
@@ -1069,11 +1161,13 @@ cmd_pr() {
             ;;
         close)
             [[ -n "${1:-}" ]] || usage_die "pr close N"
+            _no_flags "pr close" "${@:2}"
             api_send "$group" PATCH "$(repo_path)/pulls/${1}" '{"state":"closed"}' \
                 | jq -r '"Closed #\(.number): \(.title)"'
             ;;
         open)
             [[ -n "${1:-}" ]] || usage_die "pr open N"
+            _no_flags "pr open" "${@:2}"
             api_send "$group" PATCH "$(repo_path)/pulls/${1}" '{"state":"open"}' \
                 | jq -r '"Reopened #\(.number): \(.title)"'
             ;;
@@ -1147,12 +1241,14 @@ cmd_pr() {
             ;;
         detach)
             [[ -n "${1:-}" && -n "${2:-}" ]] || usage_die "pr detach N ATTACHMENT_ID"
+            _no_flags "pr detach" "${@:3}"
             api_send "$group" DELETE "$(repo_path)/issues/${1}/assets/${2}" >/dev/null
             echo "Deleted attachment #${2} from PR #${1}"
             ;;
         diff)
             [[ -n "${1:-}" ]] || usage_die "pr diff N [diff|patch]"
             local num="$1" mode="${2:-diff}"
+            _no_flags "pr diff" "${@:3}"
             [[ "$mode" == diff || "$mode" == patch ]] || usage_die "pr diff: second argument must be diff or patch"
             # Raw text endpoints, not JSON-wrapped: bypass structured_output.
             api_req "$group" GET "repos/$(resolve_repo)/pulls/${num}.${mode}" -H "Accept: text/plain"
@@ -1252,7 +1348,7 @@ cmd_pr() {
             check_fatal
             if structured_output <<<"$data"; then return 0; fi
             if [[ "$(jq 'length' <<<"$data")" -eq 0 ]]; then echo "No inline review comments."; return 0; fi
-            jq -r '.[] | "#\(.id) \(.user.login // \"unknown\") — \(.path):\(.position // .original_position // 0)\n\(.body)\n"' <<<"$data"
+            jq -r '.[] | "#\(.id) \(.user.login // "unknown") — \(.path // "-"):\((.position // .original_position // 0))\n\(.body // "")\n"' <<<"$data"
             ;;
         review-comment)
             [[ -n "${1:-}" && -n "${2:-}" ]] || usage_die "pr review-comment N REVIEW_ID --path FILE (--line N|--old-line N) --body TEXT"
@@ -1276,6 +1372,7 @@ cmd_pr() {
             local created
             created=$(api_send "$group" POST "$(repo_path)/pulls/${num}/reviews/${review_id}/comments" \
                 "$(jq -n --arg b "$body" --arg p "$path" --argjson n "$new_line" --argjson o "$old_line" --argjson e "$extra" '{body:$b,path:$p,new_position:$n,old_position:$o,extra_lines_count:$e}')")
+            check_fatal
             if structured_output <<<"$created"; then return 0; fi
             jq -r '"Created inline review comment #\(.id) on \(.path)"' <<<"$created"
             ;;
@@ -1359,6 +1456,7 @@ cmd_pr() {
             while (( i < ${#args[@]} )); do
                 case "${args[$i]}" in
                     --team) [[ -n "${args[$((i+1))]:-}" ]] || usage_die "--team NAME"; teams+=("${args[$((i+1))]}"); (( i += 2 )) ;;
+                    -*) usage_die "pr reviewer: unknown argument '${args[$i]}'" ;;
                     *) users+=("${args[$i]}"); (( i += 1 )) ;;
                 esac
             done
@@ -1450,7 +1548,8 @@ Usage: fgh release <subcommand>
   create --tag TAG [--title T] [--body TEXT | --notes-file FILE|-]
          [--target SHA|BRANCH] [--draft] [--prerelease]
   edit ID [--tag TAG] [--title T] [--body TEXT | --notes-file FILE]
-          [--target X] [--draft] [--prerelease]
+          [--target X] [--draft [true|false] | --no-draft]
+          [--prerelease [true|false] | --no-prerelease]
   delete ID
   assets ID                       list release assets
   upload ID FILE [--name NAME]    multipart upload; prints browser_download_url
@@ -1528,7 +1627,7 @@ cmd_release() {
         edit)
             [[ -n "${1:-}" ]] || usage_die "release edit ID"
             local id="$1"; shift || true
-            local tag="" title="" body="" target="" draft="" pre="" args=()
+            local tag="" title="" body="" target="" draft="" pre="" draft_set=false pre_set=false args=()
             [[ $# -gt 0 ]] && args=("$@")
             local i=0
             while (( i < ${#args[@]} )); do
@@ -1541,21 +1640,43 @@ cmd_release() {
                         if [[ "${args[$((i+1))]}" == "-" ]]; then body=$(cat); else body=$(cat "${args[$((i+1))]}"); fi
                         (( i += 2 )) ;;
                     --target) target="${args[$((i+1))]:-}"; (( i += 2 )) ;;
-                    --draft) draft=true; (( i += 1 )) ;;
-                    --prerelease) pre=true; (( i += 1 )) ;;
+                    --draft|--draft=*|--no-draft)
+                        if [[ "${args[$i]}" == --draft=* ]]; then
+                            draft="${args[$i]#--draft=}"; (( i += 1 ))
+                        elif [[ "${args[$((i+1))]:-}" == true || "${args[$((i+1))]:-}" == false ]]; then
+                            draft="${args[$((i+1))]}"; (( i += 2 ))
+                        elif [[ "${args[$i]}" == "--no-draft" ]]; then
+                            draft=false; (( i += 1 ))
+                        else
+                            draft=true; (( i += 1 ))
+                        fi
+                        case "$draft" in true|false) ;; *) usage_die "release edit --draft true|false (got '$draft')" ;; esac
+                        draft_set=true ;;
+                    --prerelease|--prerelease=*|--no-prerelease)
+                        if [[ "${args[$i]}" == --prerelease=* ]]; then
+                            pre="${args[$i]#--prerelease=}"; (( i += 1 ))
+                        elif [[ "${args[$((i+1))]:-}" == true || "${args[$((i+1))]:-}" == false ]]; then
+                            pre="${args[$((i+1))]}"; (( i += 2 ))
+                        elif [[ "${args[$i]}" == "--no-prerelease" ]]; then
+                            pre=false; (( i += 1 ))
+                        else
+                            pre=true; (( i += 1 ))
+                        fi
+                        case "$pre" in true|false) ;; *) usage_die "release edit --prerelease true|false (got '$pre')" ;; esac
+                        pre_set=true ;;
                     --json|--jq) _common_opt "${args[$i]}" "${args[$((i+1))]:-}"; i=$(( i + OPT_VALUE )) ;;
                     *) usage_die "release edit: unknown argument '${args[$i]}'" ;;
                 esac
             done
-            [[ -n "$tag$title$body$target$draft$pre" ]] || usage_die "release edit ID: nothing to edit"
+            [[ -n "$tag$title$body$target" || "$draft_set" == true || "$pre_set" == true ]] || usage_die "release edit ID: nothing to edit"
             local payload
             payload=$(jq -n --arg t "$tag" --arg n "$title" --arg b "$body" --arg tgt "$target" \
                 '{tag_name:(if $t=="" then null else $t end),
                   name:(if $n=="" then null else $n end),
                   body:(if $b=="" then null else $b end),
                   target_commitish:(if $tgt=="" then null else $tgt end)}')
-            [[ -n "$draft" ]] && payload=$(jq --argjson d "$draft" '. + {draft:$d}' <<<"$payload")
-            [[ -n "$pre" ]] && payload=$(jq --argjson p "$pre" '. + {prerelease:$p}' <<<"$payload")
+            [[ "$draft_set" == true ]] && payload=$(jq --argjson d "$draft" '. + {draft:$d}' <<<"$payload")
+            [[ "$pre_set" == true ]] && payload=$(jq --argjson p "$pre" '. + {prerelease:$p}' <<<"$payload")
             payload=$(jq 'with_entries(select(.value != null))' <<<"$payload")
             local updated
             updated=$(api_send "$group" PATCH "$(repo_path)/releases/${id}" "$payload")
@@ -1565,6 +1686,7 @@ cmd_release() {
             ;;
         delete)
             [[ -n "${1:-}" ]] || usage_die "release delete ID"
+            _no_flags "release delete" "${@:2}"
             api_send "$group" DELETE "$(repo_path)/releases/${1}" >/dev/null
             echo "Deleted release #${1} (tag kept; delete tags separately with fgh api)"
             ;;
@@ -1604,6 +1726,7 @@ cmd_release() {
             ;;
         delete-asset)
             [[ -n "${1:-}" && -n "${2:-}" ]] || usage_die "release delete-asset ID ASSET_ID"
+            _no_flags "release delete-asset" "${@:3}"
             api_send "$group" DELETE "$(repo_path)/releases/${1}/assets/${2}" >/dev/null
             echo "Deleted asset #${2} from release #${1}"
             ;;
@@ -1657,6 +1780,7 @@ cmd_package() {
         delete)
             [[ -n "${1:-}" && -n "${2:-}" && -n "${3:-}" ]] || usage_die "package delete TYPE NAME VERSION"
             local type="$1" name="$2" version="$3"
+            _no_flags "package delete" "${@:4}"
             api_send "$group" DELETE \
                 "packages/$(repo_owner)/$(urlencode "$type")/$(urlencode "$name")/$(urlencode "$version")" >/dev/null
             echo "Deleted package ${type}/${name}:${version}"
@@ -1723,26 +1847,8 @@ cmd_actions() {
             [[ -n "$workflow" ]] && q+="&workflow_id=$(urlencode "$workflow")"
             [[ -n "$run_number" ]] && q+="&run_number=$(urlencode "$run_number")"
             # ListActionRunResponse wraps {total_count, workflow_runs}
-            local page=1 fetch remaining="" batch combined="[]" count
-            if [[ -n "$OPT_LIMIT" ]]; then remaining=$OPT_LIMIT; fi
-            while :; do
-                if [[ -z "$remaining" ]]; then
-                    fetch=$PAGE_MAX
-                else
-                    fetch=$(( remaining < PAGE_MAX ? remaining : PAGE_MAX ))
-                fi
-                (( fetch == 0 )) && break
-                batch=$(api_get "$group" "${rp}/actions/runs?page=${page}&limit=${fetch}${q}" | jq '.workflow_runs // []')
-                count=$(jq 'length' <<<"$batch")
-                (( count == 0 )) && break
-                combined=$(jq -s 'add' <(printf '%s' "$combined") <(printf '%s' "$batch"))
-                if [[ -n "$remaining" ]]; then
-                    remaining=$(( remaining - count ))
-                    (( remaining <= 0 )) && break
-                fi
-                (( count < fetch )) && break
-                page=$(( page + 1 ))
-            done
+            local combined
+            combined=$(_paginate_unwrap "$group" "${rp}/actions/runs" "$q")
             check_fatal
             if structured_output <<<"$combined"; then return 0; fi
             if [[ "$(jq 'length' <<<"$combined")" -eq 0 ]]; then echo "No workflow runs."; return 0; fi
@@ -1762,6 +1868,7 @@ cmd_actions() {
             check_fatal
             if structured_output <<<"$run"; then return 0; fi
             jobs=$(api_get "$group" "$(repo_path)/actions/runs/${1}/jobs")
+            check_fatal
             jq -r --argjson jobs "$jobs" '
                 "Run #\(.id)  [\(.status // "-")]  \(.title // "-")",
                 "",
@@ -1820,6 +1927,12 @@ cmd_actions() {
                     fi
                     echo "Run #${run_id}: $status" >&2
                     return 1 ;;
+                    # Known in-progress statuses keep polling; anything else
+                    # (future Forgejo status name, API change, ...) fails fast
+                    # instead of polling to the timeout on an unclassifiable
+                    # status.
+                    running|waiting|pending) ;;
+                    *) die "unknown run status \"${status}\" for run ${run_id}" ;;
                 esac
                 if (( deadline > 0 )) && (( $(date +%s) >= deadline )); then
                     echo "" >&2
@@ -1848,7 +1961,7 @@ cmd_actions() {
                 esac
             done
             rp=$(repo_path)
-            TOKEN=$(select_token "$group")
+            prepare_curl_auth "$group"
             local base="${FORGEJO_URL%/}/api/v1/${rp}/actions"
             if [[ -n "$job_id" ]]; then
                 local q=""
@@ -1857,11 +1970,11 @@ cmd_actions() {
                     _follow_job_logs "$group" "$rp" "$run_id" "$job_id" "$q" "$log_timeout"
                 else
                     local tmp
-                    tmp=$(mktemp "${TMPDIR:-/tmp}/fgh.XXXXXX")
+                    tmp=$(mktemp "$_FGH_TMPDIR/fgh.XXXXXX")
                     local code rc=0
                     set +e
                     code=$(curl -sS -o "$tmp" -w '%{http_code}' \
-                        -H "Authorization: token ${TOKEN}" \
+                        -H "@$_FGH_AUTH_FILE" \
                         "${base}/jobs/${job_id}/logs${q}" 2>/dev/null)
                     rc=$?
                     set -e
@@ -1878,11 +1991,11 @@ cmd_actions() {
                     usage_die "actions logs --follow requires --job JOB_ID (run archives are static)"
                 fi
                 local zip
-                zip=$(mktemp "${TMPDIR:-/tmp}/fgh.XXXXXX")
+                zip=$(mktemp "$_FGH_TMPDIR/fgh.XXXXXX")
                 local code rc=0
                 set +e
                 code=$(curl -sS -o "$zip" -w '%{http_code}' \
-                    -H "Authorization: token ${TOKEN}" \
+                    -H "@$_FGH_AUTH_FILE" \
                     "${base}/runs/${run_id}/logs" 2>/dev/null)
                 rc=$?
                 set -e
@@ -1922,26 +2035,8 @@ cmd_actions() {
             rp=$(repo_path)
             local q=""
             [[ -n "$status" ]] && q+="&status=$(urlencode "$status")"
-            local page=1 fetch remaining="" batch combined="[]" count
-            [[ -n "$OPT_LIMIT" ]] && remaining=$OPT_LIMIT
-            while :; do
-                if [[ -z "$remaining" ]]; then
-                    fetch=$PAGE_MAX
-                else
-                    fetch=$(( remaining < PAGE_MAX ? remaining : PAGE_MAX ))
-                fi
-                (( fetch == 0 )) && break
-                batch=$(api_get "$group" "${rp}/actions/tasks?page=${page}&limit=${fetch}${q}" | jq '.workflow_runs // []')
-                count=$(jq 'length' <<<"$batch")
-                (( count == 0 )) && break
-                combined=$(jq -s 'add' <(printf '%s' "$combined") <(printf '%s' "$batch"))
-                if [[ -n "$remaining" ]]; then
-                    remaining=$(( remaining - count ))
-                    (( remaining <= 0 )) && break
-                fi
-                (( count < fetch )) && break
-                page=$(( page + 1 ))
-            done
+            local combined
+            combined=$(_paginate_unwrap "$group" "${rp}/actions/tasks" "$q")
             check_fatal
             if structured_output <<<"$combined"; then return 0; fi
             if [[ "$(jq 'length' <<<"$combined")" -eq 0 ]]; then echo "No queued tasks."; return 0; fi
@@ -1985,11 +2080,13 @@ cmd_actions() {
             ;;
         cancel)
             [[ -n "${1:-}" ]] || usage_die "actions cancel RUN_ID"
+            _no_flags "actions cancel" "${@:2}"
             api_send "$group" POST "$(repo_path)/actions/runs/${1}/cancel" "" >/dev/null
             echo "Cancelled run #${1}"
             ;;
         delete)
             [[ -n "${1:-}" ]] || usage_die "actions delete RUN_ID"
+            _no_flags "actions delete" "${@:2}"
             api_send "$group" DELETE "$(repo_path)/actions/runs/${1}" >/dev/null
             echo "Deleted run #${1}"
             ;;
@@ -2031,12 +2128,12 @@ cmd_actions() {
                 download)
                     [[ -n "${1:-}" && -n "${2:-}" ]] || usage_die "actions artifact download ARTIFACT_ID OUTFILE"
                     rp=$(repo_path)
-                    TOKEN=$(select_token "$group")
+                    prepare_curl_auth "$group"
                     local out_file="$2" code dl rc=0
-                    dl=$(mktemp "${TMPDIR:-/tmp}/fgh.XXXXXX")
+                    dl=$(mktemp "$_FGH_TMPDIR/fgh.XXXXXX")
                     set +e
                     code=$(curl -sS -o "$dl" -w '%{http_code}' \
-                        -H "Authorization: token ${TOKEN}" \
+                        -H "@$_FGH_AUTH_FILE" \
                         "${FORGEJO_URL%/}/api/v1/${rp}/actions/artifacts/${1}/zip" 2>/dev/null)
                     rc=$?
                     set -e
@@ -2049,6 +2146,7 @@ cmd_actions() {
                     ;;
                 delete)
                     [[ -n "${1:-}" ]] || usage_die "actions artifact delete ARTIFACT_ID"
+                    _no_flags "actions artifact delete" "${@:2}"
                     api_send "$group" DELETE "$(repo_path)/actions/artifacts/${1}" >/dev/null
                     echo "Deleted artifact #${1}"
                     ;;
@@ -2075,6 +2173,7 @@ cmd_actions() {
                     local value=""
                     if [[ "${1:-}" == "--body" ]]; then
                         value="${2:-}"
+                        shift 2 || true
                     elif [[ ! -t 0 ]]; then
                         value=$(cat)
                     else
@@ -2082,6 +2181,7 @@ cmd_actions() {
                         read -r value
                     fi
                     [[ -n "$value" ]] || die "refusing to set an empty secret"
+                    _no_flags "actions secret set" "$@"
                     rp=$(repo_path)
                     # Forgejo secret create-or-update: PUT {"data": value}; 201 new, 204 update.
                     api_req "$group" PUT "${rp}/actions/secrets/$(urlencode "$name")" \
@@ -2091,6 +2191,7 @@ cmd_actions() {
                     ;;
                 delete)
                     [[ -n "${1:-}" ]] || usage_die "actions secret delete NAME"
+                    _no_flags "actions secret delete" "${@:2}"
                     api_send "$group" DELETE "$(repo_path)/actions/secrets/$(urlencode "$1")" >/dev/null
                     echo "Deleted secret: ${1}"
                     ;;
@@ -2114,6 +2215,7 @@ cmd_actions() {
                 set)
                     [[ -n "${1:-}" && -n "${2:-}" ]] || usage_die "actions variable set NAME VALUE"
                     local name="$1" value="$2" lookup_code
+                    _no_flags "actions variable set" "${@:3}"
                     rp=$(repo_path)
                     HTTP_ALLOW_ERROR=true
                     set +e
@@ -2135,6 +2237,7 @@ cmd_actions() {
                     ;;
                 delete)
                     [[ -n "${1:-}" ]] || usage_die "actions variable delete NAME"
+                    _no_flags "actions variable delete" "${@:2}"
                     api_send "$group" DELETE "$(repo_path)/actions/variables/$(urlencode "$1")" >/dev/null
                     echo "Deleted variable: ${1}"
                     ;;
@@ -2170,8 +2273,12 @@ cmd_actions() {
                 view)
                     [[ -n "${1:-}" ]] || usage_die "actions runner view RUNNER_ID"
                     local data; data=$(api_get "$group" "$(repo_path)/actions/runners/${1}")
+                    check_fatal
                     if structured_output <<<"$data"; then return 0; fi
-                    jq -r '"#\(.id) \(.name // \"-\") [\(.status // \"-\")]\nLabels: \((.labels // []) | join(\",\"))\nVersion: \(.version // \"-\")\nDescription: \(.description // \"-\")"' <<<"$data"
+                    jq -r '"#\(.id) \(.name // "-") [\(.status // "-")]",
+                           "Labels: \((.labels // []) | join(","))",
+                           "Version: \(.version // "-")",
+                           "Description: \(.description // "-")"' <<<"$data"
                     ;;
                 register)
                     local name="" description="" ephemeral=false args=(); [[ $# -gt 0 ]] && args=("$@")
@@ -2188,8 +2295,11 @@ cmd_actions() {
                     local created
                     created=$(api_send "$group" POST "$(repo_path)/actions/runners" \
                         "$(jq -n --arg n "$name" --arg d "$description" --argjson e "$ephemeral" '{name:$n, description:$d, ephemeral:$e}')")
+                    check_fatal
                     if structured_output <<<"$created"; then return 0; fi
-                    jq -r '"Registered runner #\(.id) \(.name // \"\")\nUUID: \(.uuid // \"-\")\nToken: \(.token // \"-\")"' <<<"$created"
+                    jq -r '"Registered runner #\(.id) \(.name // "")",
+                           "UUID: \(.uuid // "-")",
+                           "Token: \(.token // "-")"' <<<"$created"
                     ;;
                 jobs)
                     local labels="" args=(); [[ $# -gt 0 ]] && args=("$@")
@@ -2203,15 +2313,18 @@ cmd_actions() {
                     local path; path="$(repo_path)/actions/runners/jobs"
                     [[ -n "$labels" ]] && path+="?labels=$(urlencode "$labels")"
                     local data; data=$(api_get "$group" "$path")
+                    check_fatal
                     if structured_output <<<"$data"; then return 0; fi
                     jq -r --arg sep "$(_tab)" '.[] | [(.id|tostring), (.name // "-"), (.status // "-"), ((.runs_on // []) | join(","))] | join($sep)' \
                         <<<"$data" | { echo -e "ID\tNAME\tSTATUS\tLABELS"; cat; } | column -t -s "$(printf '\t')"
                     ;;
                 token)
+                    _no_flags "actions runner token" "$@"
                     api_get "$group" "$(repo_path)/actions/runners/registration-token" | jq -r '.token // empty'
                     ;;
                 delete)
                     [[ -n "${1:-}" ]] || usage_die "actions runner delete RUNNER_ID"
+                    _no_flags "actions runner delete" "${@:2}"
                     api_send "$group" DELETE "$(repo_path)/actions/runners/${1}" >/dev/null
                     echo "Deleted runner #${1}"
                     ;;
@@ -2231,14 +2344,16 @@ cmd_actions() {
 _follow_job_logs() {
     local group="$1" rp="$2" run_id="$3" job_id="$4" query="$5" timeout="$6"
     local logtmp interval=3 offset=0 deadline=0 code rc=0 status
-    logtmp=$(mktemp "${TMPDIR:-/tmp}/fgh.XXXXXX")
+    # Stream buffer lives inside the private 0700 temp dir: streamed log bytes
+    # are not world-readable and cleanup rides the BASHPID-guarded EXIT trap.
+    logtmp=$(mktemp "$_FGH_TMPDIR/fgh.XXXXXX")
     [[ -n "$timeout" ]] && deadline=$(( $(date +%s) + timeout ))
     local log_url="${FORGEJO_URL%/}/api/v1/${rp}/actions/jobs/${job_id}/logs${query}"
     while :; do
         : >"$logtmp"
         set +e
         code=$(curl -sS -o "$logtmp" -w '%{http_code}' \
-            -H "Authorization: token ${TOKEN}" \
+            -H "@$_FGH_AUTH_FILE" \
             -H "Range: bytes=${offset}-" \
             "$log_url" 2>/dev/null)
         rc=$?
@@ -2260,8 +2375,29 @@ _follow_job_logs() {
             *)   rm -f "$logtmp"; die "unexpected HTTP $code streaming job #${job_id} logs" ;;
         esac
         # No single-job status endpoint in 16.0.3; inspect the known parent run.
-        status=$(api_get "$group" "${rp}/actions/runs/${run_id}/jobs" 2>/dev/null \
-            | jq -r --arg j "$job_id" '[.[] | select(.id == ($j|tonumber))][0].status // empty' || true)
+        # Allow the error through so we can report it with follow-specific
+        # context (a bare api_req failure would exit silently via the fatal
+        # marker, leaving the follow loop to look like a hang/timeout).
+        # api_req runs in THIS shell (not a $( ) subshell) so HTTP_CODE and
+        # HTTP_BODY_FILE remain visible afterwards.
+        local jobs_code jobs_resp
+        HTTP_ALLOW_ERROR=true
+        set +e
+        api_req "$group" GET "${rp}/actions/runs/${run_id}/jobs"
+        set -e
+        HTTP_ALLOW_ERROR=false
+        jobs_code=$HTTP_CODE
+        jobs_resp=$(_response_body)
+        status=""
+        if [[ "$jobs_code" == 2* && -n "$jobs_resp" ]]; then
+            status=$(jq -r --arg j "$job_id" '[.[] | select(.id == ($j|tonumber))][0].status // empty' <<<"$jobs_resp" 2>/dev/null) || status=""
+        fi
+        if [[ -z "$status" ]]; then
+            # Status unknown: HTTP failure or unusable response. Fail loudly
+            # instead of polling forever on a misleading timeout.
+            rm -f "$logtmp"
+            die "could not determine status of job #${job_id} (HTTP ${jobs_code:-failure} fetching run ${run_id} jobs)"
+        fi
         case "$status" in
             success) rm -f "$logtmp"; return 0 ;;
             failure|cancelled|skipped|blocked)
@@ -2377,14 +2513,14 @@ cmd_api() {
     fi
     [[ -n "$payload" ]] && curl_args+=(-H "Content-Type: application/json" -d "$payload")
     [[ "$method" == "GET" && ${#curl_args[@]} -gt 0 && -z "$payload" ]] && true
-    TOKEN=$(select_token "$group")
+    prepare_curl_auth "$group"
     local out code rc=0
-    out=$(mktemp "${TMPDIR:-/tmp}/fgh.XXXXXX")
+    out=$(mktemp "$_FGH_TMPDIR/fgh.XXXXXX")
     set +e
     code=$(curl -sS -o "$out" -w '%{http_code}' \
         -X "$method" \
-        -H "Authorization: token ${TOKEN}" \
         -H "Accept: application/json" \
+        -H "@$_FGH_AUTH_FILE" \
         "${curl_args[@]}" \
         "${FORGEJO_URL%/}/api/v1/${endpoint}" 2>/dev/null)
     rc=$?
@@ -2440,6 +2576,8 @@ Common options on list/view commands:
   --jq EXPR           jq expression over the JSON (implies JSON)
   --limit N           cap result count (server pages of ≤50)
   --state open|closed|all   where supported
+  These options are accepted only by the list/view commands that support
+  them; elsewhere they are rejected as unknown arguments (exit 2).
 
 Token selection: FGH_TOKEN wins everywhere. FORGEJO_ISSUE_TOKEN is used only
 by issue/label/milestone commands; FORGEJO_TOKEN covers everything else.
@@ -2461,12 +2599,16 @@ shift_rest() {
 
 # Remove output/pagination options from command arguments so every list/view
 # surface handles them consistently, including nested commands.
+# PASSTHROUGH=1 leaves --json/--jq/--limit in `rest` (used by commands that
+# don't support them, so their own parser reports an unknown argument).
 extract_common_options() {
+    local passthrough="${1:-}"
     local -a input=("${rest[@]}") output=()
     local idx=0
     while (( idx < ${#input[@]} )); do
         case "${input[$idx]}" in
             --json)
+                [[ -n "$passthrough" ]] && { output+=("${input[$idx]}"); idx=$(( idx + 1 )); continue; }
                 if (( idx + 1 < ${#input[@]} )) && [[ "${input[$((idx+1))]}" != -* ]]; then
                     OPT_JSON="${input[$((idx+1))]}"
                     idx=$(( idx + 2 ))
@@ -2475,10 +2617,12 @@ extract_common_options() {
                     idx=$(( idx + 1 ))
                 fi ;;
             --jq)
+                [[ -n "$passthrough" ]] && { output+=("${input[$idx]}"); idx=$(( idx + 1 )); continue; }
                 (( idx + 1 < ${#input[@]} )) || usage_die "--jq EXPR"
                 OPT_JQ="${input[$((idx+1))]}"
                 idx=$(( idx + 2 )) ;;
             --limit)
+                [[ -n "$passthrough" ]] && { output+=("${input[$idx]}"); idx=$(( idx + 1 )); continue; }
                 if (( idx + 1 >= ${#input[@]} )) || [[ ! "${input[$((idx+1))]}" =~ ^[0-9]+$ ]]; then
                     usage_die "--limit N"
                 fi
@@ -2490,6 +2634,55 @@ extract_common_options() {
         esac
     done
     rest=("${output[@]}")
+}
+
+# Which (command, subcommand) pairs support --json/--jq/--limit. The global
+# pre-pass strips those options ONLY for supported surfaces; everywhere else
+# the flags pass through and the command's own parser reports an unknown
+# argument (usage_die, exit 2) instead of silently ignoring them. Nested
+# groups (actions artifact/secret/variable/runner, pr reviewer subcommands)
+# resolve by their sub-subcommand. A missing subcommand takes the group's
+# default sub (always a list-style command, e.g. `fgh issue` == `issue list`),
+# so it counts as supporting.
+_common_opts_supported() {
+    local cmd="$1" sub="${2:-}" subsub="${3:-}"
+    case "$cmd:$sub" in
+        issue:|issue:list|issue:view|issue:create|issue:edit|issue:comments|issue:comment|issue:attach|issue:attach-list|issue:comment-attach|issue:comment-attachments) return 0 ;;
+        issue:close|issue:open|issue:detach|issue:comment-detach) return 1 ;;
+        label:|label:list|label:create|label:edit) return 0 ;;
+        label:delete|label:ensure) return 1 ;;
+        milestone:|milestone:list|milestone:create|milestone:edit) return 0 ;;
+        milestone:delete) return 1 ;;
+        pr:|pr:list|pr:view|pr:create|pr:edit|pr:comments|pr:comment|pr:attach|pr:attach-list|pr:files|pr:commits|pr:checks|pr:status|pr:reviews|pr:review-comments|pr:review|pr:review-reply) return 0 ;;
+        pr:close|pr:open|pr:diff|pr:detach|pr:merge|pr:reviewer|pr:update-branch) return 1 ;;
+        release:|release:list|release:view|release:create|release:edit|release:assets|release:upload) return 0 ;;
+        release:delete|release:delete-asset) return 1 ;;
+        package:|package:list) return 0 ;;
+        package:delete) return 1 ;;
+        actions:) return 0 ;;
+        actions:list|actions:view|actions:jobs|actions:tasks|actions:dispatch) return 0 ;;
+        actions:watch|actions:logs|actions:cancel|actions:delete) return 1 ;;
+        actions:artifact) case "$subsub" in ""|list) return 0 ;; *) return 1 ;; esac ;;
+        actions:secret|actions:variable) case "$subsub" in list) return 0 ;; *) return 1 ;; esac ;;
+        actions:runner) case "$subsub" in ""|list|view|register|jobs) return 0 ;; *) return 1 ;; esac ;;
+        repo:*) return 0 ;;
+        instance:*) return 0 ;;
+        # api has its own --jq parser (excluded upstream); an unknown command
+        # falls through to the dispatch error, which shouldn't be masked by a
+        # flag-validation error — strip stays the safe default for both.
+        *) return 0 ;;
+    esac
+}
+
+# _no_flags LABEL ARGS... — commands that accept no options reject unknown
+# flags/extra arguments instead of silently ignoring them. Used together with
+# the pass-through pre-pass so e.g. `fgh issue close 5 --json` errors.
+_no_flags() {
+    local label="$1"; shift
+    local a
+    for a in "$@"; do
+        case "$a" in -*) usage_die "$label: unknown argument '$a'" ;; esac
+    done
 }
 
 main() {
@@ -2509,12 +2702,23 @@ main() {
     local cmd="${rest[0]:-help}"
     shift_rest
     reset_opts
-    [[ "$cmd" == "api" ]] || extract_common_options
+    if [[ "$cmd" == "api" ]]; then
+        : # api parses its own --jq; nothing to strip
+    else
+        # A5: strip --json/--jq/--limit only on surfaces that support them;
+        # non-supporting commands see the raw flags and report them through
+        # their own parser's unknown-argument path.
+        local passthrough=""
+        _common_opts_supported "$cmd" "${rest[0]:-}" "${rest[1]:-}" || passthrough=1
+        extract_common_options "$passthrough"
+    fi
     # Validate repository resolution in the TOP-LEVEL shell: die() inside
-    # $( ) subshells (repo_path callers) cannot abort the process.
+    # $( ) subshells (repo_path callers) cannot abort the process. Only run
+    # it for KNOWN repo-bound commands: an unknown subcommand must fall
+    # through to the dispatch ('Unknown command: X' + help, exit 1) below
+    # regardless of repo availability, never be masked by a repo error.
     case "$cmd" in
-        help|--help|-h|version|--version|-v|api|instance) ;;
-        *) resolve_repo >/dev/null ;;
+        issue|label|milestone|pr|release|package|actions|repo) resolve_repo >/dev/null ;;
     esac
     case "$cmd" in
         help|--help|-h) print_help ;;

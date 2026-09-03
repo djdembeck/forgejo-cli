@@ -13,6 +13,18 @@ Log_line() {
     sed -n "${1}p" "$FAKE_CURL_LOG" 2>/dev/null | sed 's/\\//g'
 }
 
+# Log_headers N — space-joined expanded header lines of call N (1-based).
+# The fake curl writes post-@file header lines to $FAKE_CURL_LOG.hdrs, one
+# ---END-HDRS---terminated group per call in the same order as the argv log.
+# Authorization arrives via `curl -H @file` (FIX 6), so it lives here and
+# never in the argv log.
+Log_headers() {
+    awk -v target="$1" '
+        BEGIN { RS = "---END-HDRS---\n"; n = 0 }
+        { n++; if (n == target) { gsub(/^HDR /, ""); gsub(/\nHDR /, " "); gsub(/\n$/, ""); printf "%s", $0; exit } }
+    ' "${FAKE_CURL_LOG}.hdrs" 2>/dev/null
+}
+
 # Log_body N — request body of call N (between ---END-CALL--- markers).
 Log_body() {
     awk -v target="$1" '

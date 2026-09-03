@@ -66,6 +66,7 @@ run_case() {
     case_name="$(basename "$case_file")"
     : > "$FAKE_CURL_LOG"
     : > "$FAKE_CURL_LOG.bodies"
+    : > "${FAKE_CURL_LOG}.hdrs"
     : > "$FAKE_CURL_SCRIPT"
     export FGH_REPO="acme/widgets"
     # shellcheck disable=SC1090
