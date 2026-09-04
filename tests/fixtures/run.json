@@ -1,0 +1,5 @@
+{ "id": 123, "title": "ci on main", "status": "success", "event": "push",
+  "prettyref": "refs/heads/main", "head_sha": "abc1234567890def",
+  "started": "2026-08-20T10:00:00Z", "stopped": "2026-08-20T10:05:00Z",
+  "created": "2026-08-20T09:59:00Z", "trigger_user": {"login": "alice"},
+  "duration": 360000000000, "html_url": "https://forgejo.test/o/r/actions/runs/123" }

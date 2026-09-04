@@ -1,0 +1,4 @@
+[
+  { "id": 3, "name": "bug", "color": "#d73a4a", "description": "Something isn't working" },
+  { "id": 4, "name": "enhancement", "color": "#84b6eb", "description": "New feature" }
+]

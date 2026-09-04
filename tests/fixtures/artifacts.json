@@ -1,0 +1,6 @@
+[
+  { "id": 55, "name": "dist", "size_in_bytes": 1536, "expired": false,
+    "run_id": 123, "created_at": "2026-08-20T10:05:00Z" },
+  { "id": 56, "name": "coverage", "size_in_bytes": 1024, "expired": true,
+    "run_id": 123, "created_at": "2026-08-20T10:06:00Z" }
+]

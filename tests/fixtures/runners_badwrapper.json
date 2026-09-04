@@ -1,0 +1,2 @@
+{ "runners": [ { "id": 11, "name": "shell-1", "status": "idle",
+    "labels": ["self-hosted"], "version": "6.0.0" } ] }

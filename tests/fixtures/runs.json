@@ -1,0 +1,8 @@
+{ "total_count": 2, "workflow_runs": [
+  { "id": 123, "title": "ci on main", "status": "success", "event": "push",
+    "prettyref": "refs/heads/main", "head_sha": "abc1234567890def",
+    "started": "2026-08-20T10:00:00Z", "workflow_id": "ci.yml" },
+  { "id": 124, "title": "nightly", "status": "running", "event": "schedule",
+    "prettyref": "refs/heads/main", "head_sha": "fff000111222333",
+    "started": "2026-08-21T02:00:00Z", "workflow_id": "nightly.yml" }
+] }
