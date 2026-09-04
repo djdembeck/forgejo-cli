@@ -502,6 +502,7 @@ cmd_issue() {
         view)
             [[ -n "${1:-}" ]] || usage_die "issue view ISSUE_NUMBER"
             local num="$1"; shift || true
+            _no_flags "issue view" "$@"
             local data
             data=$(api_get "$group" "$(repo_path)/issues/${num}")
             check_fatal
@@ -715,6 +716,7 @@ cmd_issue() {
         attach-list)
             [[ -n "${1:-}" ]] || usage_die "issue attach-list N"
             local num="$1"; shift || true
+            _no_flags "issue attach-list" "$@"
             local data
             data=$(_paginate "$group" "$(repo_path)/issues/${num}/assets")
             check_fatal
@@ -1075,6 +1077,7 @@ cmd_pr() {
             ;;
         view)
             [[ -n "${1:-}" ]] || usage_die "pr view N"
+            _no_flags "pr view" "${@:2}"
             local data
             data=$(api_get "$group" "$(repo_path)/pulls/${1}")
             check_fatal
@@ -1230,6 +1233,7 @@ cmd_pr() {
             ;;
         attach-list)
             [[ -n "${1:-}" ]] || usage_die "pr attach-list N"
+            _no_flags "pr attach-list" "${@:2}"
             local data
             data=$(_paginate "$group" "$(repo_path)/issues/${1}/assets")
             check_fatal
@@ -1576,6 +1580,7 @@ cmd_release() {
         view)
             [[ -n "${1:-}" ]] || usage_die "release view ID|TAG"
             local ref="$1"; shift || true
+            _no_flags "release view" "$@"
             local data
             if [[ "$ref" =~ ^[0-9]+$ ]]; then
                 data=$(api_get "$group" "$(repo_path)/releases/${ref}")
@@ -1692,6 +1697,7 @@ cmd_release() {
             ;;
         assets)
             [[ -n "${1:-}" ]] || usage_die "release assets ID"
+            _no_flags "release assets" "${@:2}"
             local data
             data=$(api_get "$group" "$(repo_path)/releases/${1}/assets")
             check_fatal
@@ -1815,6 +1821,8 @@ _set_action_url_repo() {
     if [[ -n "$configured" && "$configured" != "$slug" ]]; then
         die "Actions URL is for '$slug', but the selected repository is '$configured'; remove -R/FGH_REPO or use the matching repository"
     fi
+    # Defense-in-depth against future refactors: the URL selector regex already guarantees two non-empty slash-free segments, so this keeps URL-derived slugs under the same constraint as -R/FGH_REPO-derived ones rather than catching real user input.
+    validate_repo_slug "$slug" "Actions URL repository"
     REPO_SLUG="$slug"
 }
 
@@ -1983,7 +1991,7 @@ cmd_actions() {
                 "",
                 "Jobs (UI index / REST ID):",
                 (if ($jobs|length) == 0 then "  (none)"
-                 else $jobs | to_entries[] | "  \(.key) / #\(.value.id)  [\(.value.status)] \(.value.name)  (attempt \(.value.attempt // 1))" end)' <<<"$run"
+                 else $jobs | sort_by(.id) | to_entries[] | "  \(.key) / #\(.value.id)  [\(.value.status)] \(.value.name)  (attempt \(.value.attempt // 1))" end)' <<<"$run"
             ;;
         jobs)
             _resolve_simple_action_run "$group" "actions jobs RUN | actions jobs --run-number N" "$@"
@@ -2407,6 +2415,7 @@ cmd_actions() {
                     ;;
                 view)
                     [[ -n "${1:-}" ]] || usage_die "actions runner view RUNNER_ID"
+                    _no_flags "actions runner view" "${@:2}"
                     local data; data=$(api_get "$group" "$(repo_path)/actions/runners/${1}")
                     check_fatal
                     if structured_output <<<"$data"; then return 0; fi
@@ -2734,10 +2743,11 @@ shift_rest() {
 
 # Remove output/pagination options from command arguments so every list/view
 # surface handles them consistently, including nested commands.
-# PASSTHROUGH=1 leaves --json/--jq/--limit in `rest` (used by commands that
-# don't support them, so their own parser reports an unknown argument).
+# PASSTHROUGH=1 leaves --json/--jq in `rest` (used by commands that don't
+# support them, so their own parser reports an unknown argument).
+# LIMIT_OK=1 strips --limit; 0 leaves it in `rest` for the command's parser.
 extract_common_options() {
-    local passthrough="${1:-}"
+    local passthrough="${1:-}" limit_ok="${2:-1}"
     local -a input=("${rest[@]}") output=()
     local idx=0
     while (( idx < ${#input[@]} )); do
@@ -2757,7 +2767,9 @@ extract_common_options() {
                 OPT_JQ="${input[$((idx+1))]}"
                 idx=$(( idx + 2 )) ;;
             --limit)
-                [[ -n "$passthrough" ]] && { output+=("${input[$idx]}"); idx=$(( idx + 1 )); continue; }
+                if [[ "$limit_ok" != 1 ]]; then
+                    output+=("${input[$idx]}"); idx=$(( idx + 1 )); continue
+                fi
                 if (( idx + 1 >= ${#input[@]} )) || [[ ! "${input[$((idx+1))]}" =~ ^[0-9]+$ ]]; then
                     usage_die "--limit N"
                 fi
@@ -2771,10 +2783,12 @@ extract_common_options() {
     rest=("${output[@]}")
 }
 
-# Which (command, subcommand) pairs support --json/--jq/--limit. The global
+# Which (command, subcommand) pairs support --json/--jq. The global
 # pre-pass strips those options ONLY for supported surfaces; everywhere else
 # the flags pass through and the command's own parser reports an unknown
-# argument (usage_die, exit 2) instead of silently ignoring them. Nested
+# argument (usage_die, exit 2) instead of silently ignoring them. --limit
+# support is tracked separately by _limit_supported (see below), because only
+# paginated list surfaces honor it. Nested
 # groups (actions artifact/secret/variable/runner, pr reviewer subcommands)
 # resolve by their sub-subcommand. A missing subcommand takes the group's
 # default sub (always a list-style command, e.g. `fgh issue` == `issue list`),
@@ -2809,6 +2823,39 @@ _common_opts_supported() {
     esac
 }
 
+# Which (command, subcommand) pairs support --limit. Authority: the command
+# bodies that walk pages via _paginate/_paginate_unwrap (which honor OPT_LIMIT
+# as a page cap). This includes `issue attach-list` / `pr attach-list`,
+# which walk /issues/N/assets via _paginate. Single-fetch surfaces (views,
+# release assets, comment-attachments, runner jobs, repo/instance, api) are
+# NOT in this set and must
+# REJECT --limit: the pre-pass leaves it in `rest` and the command's own
+# parser reports an unknown argument (usage_die, exit 2) instead of silently
+# swallowing it. Nested groups resolve by their sub-subcommand; a missing
+# subcommand takes the group's default (a paginated list) and counts as
+# supporting. NOTE: `label ensure` paginates an existence lookup against its
+# fixed 5-label set, so it honors --limit even though it also mutates (a
+# documented judgment call); the review-list pagination belongs to `pr
+# review-comments`, a read command — the mutating `pr review` does NOT
+# paginate and must reject --limit.
+_limit_supported() {
+    local cmd="$1" sub="${2:-}" subsub="${3:-}"
+    case "$cmd:$sub" in
+        issue:|issue:list|issue:comments|issue:attach-list) return 0 ;;
+        label:|label:list|label:ensure) return 0 ;;
+        milestone:|milestone:list) return 0 ;;
+        pr:|pr:list|pr:comments|pr:files|pr:commits|pr:reviews|pr:review-comments|pr:attach-list) return 0 ;;
+        release:|release:list) return 0 ;;
+        package:|package:list) return 0 ;;
+        actions:) return 0 ;;
+        actions:list|actions:jobs|actions:tasks) return 0 ;;
+        actions:artifact) case "$subsub" in ""|list) return 0 ;; *) return 1 ;; esac ;;
+        actions:secret|actions:variable) case "$subsub" in list) return 0 ;; *) return 1 ;; esac ;;
+        actions:runner) case "$subsub" in ""|list) return 0 ;; *) return 1 ;; esac ;;
+        *) return 1 ;;
+    esac
+}
+
 # _no_flags LABEL ARGS... — commands that accept no options reject unknown
 # flags/extra arguments instead of silently ignoring them. Used together with
 # the pass-through pre-pass so e.g. `fgh issue close 5 --json` errors.
@@ -2840,12 +2887,13 @@ main() {
     if [[ "$cmd" == "api" ]]; then
         : # api parses its own --jq; nothing to strip
     else
-        # A5: strip --json/--jq/--limit only on surfaces that support them;
-        # non-supporting commands see the raw flags and report them through
-        # their own parser's unknown-argument path.
-        local passthrough=""
+        # A5: strip --json/--jq and (separately) --limit only on surfaces
+        # that support them; non-supporting commands see the raw flags and
+        # report them through their own parser's unknown-argument path.
+        local passthrough="" limit_ok=1
         _common_opts_supported "$cmd" "${rest[0]:-}" "${rest[1]:-}" || passthrough=1
-        extract_common_options "$passthrough"
+        _limit_supported "$cmd" "${rest[0]:-}" "${rest[1]:-}" || limit_ok=0
+        extract_common_options "$passthrough" "$limit_ok"
     fi
     # Validate repository resolution in the TOP-LEVEL shell: die() inside
     # $( ) subshells (repo_path callers) cannot abort the process. Only run
