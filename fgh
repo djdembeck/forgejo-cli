@@ -1902,7 +1902,12 @@ Usage: fgh actions <subcommand>
   jobs RUN | jobs --run-number N [--limit N] [--json [FIELDS]] [--jq EXPR]
   watch RUN | watch --run-number N [--timeout SEC] [--interval SEC]
   logs RUN | logs --run-number N [--job JOB_ID | --job-index N]
-           [--attempt N] [--follow] [--timeout SEC]
+           [--attempt N] [--step N] [--grep TEXT [--ignore-case]] [--ndjson]
+           [--follow] [--timeout SEC]
+  Job-log filters require Forgejo 17+ and a job selector. --step N selects one
+  step (0 is Set up job); --grep TEXT is a plain substring match, not a regex.
+  --ignore-case requires --grep. --ndjson prints server-formatted {time, content}
+  objects. --grep and --ndjson cannot be combined with --follow; --step can.
   tasks [--status S] [--limit N] [--json [FIELDS]] [--jq EXPR]   task queue
   dispatch WORKFLOW_FILE --ref REF [--input K=V]...
   cancel RUN | cancel --run-number N
@@ -2058,25 +2063,57 @@ cmd_actions() {
         logs)
             # Forgejo 16.0.3:
             #   GET /actions/runs/{id}/logs   → ZIP archive of per-job .log files
-            #   GET /actions/jobs/{id}/logs   → plaintext (supports ?attempt=N and
-            #                                   Range requests for --follow)
-            local selector="" run_number="" job_id="" job_index="" attempt="" follow=false log_timeout="" args=()
+            #   GET /actions/jobs/{id}/logs   → plaintext or filtered output (Forgejo 17+)
+            #                                   (Range requests for --follow)
+            local selector="" run_number="" job_id="" job_index="" attempt="" follow=false log_timeout="" step="" step_set=false grep_text="" grep_set=false ignore_case=false ndjson=false args=()
             [[ $# -gt 0 ]] && args=("$@")
             local i=0
             while (( i < ${#args[@]} )); do
                 case "${args[$i]}" in
-                    --run-number) run_number="${args[$((i+1))]:-}"; (( i += 2 )) ;;
-                    --job|-j) job_id="${args[$((i+1))]:-}"; (( i += 2 )) ;;
-                    --job-index) job_index="${args[$((i+1))]:-}"; (( i += 2 )) ;;
-                    --attempt) attempt="${args[$((i+1))]:-}"; (( i += 2 )) ;;
+                    --run-number|--job|-j|--job-index|--attempt|--timeout)
+                        local option="${args[$i]}"
+                        if (( i + 1 >= ${#args[@]} )) || [[ "${args[$((i+1))]}" == -* ]]; then usage_die "$option requires a value"; fi
+                        case "$option" in
+                            --run-number) run_number="${args[$((i+1))]}" ;;
+                            --job|-j) job_id="${args[$((i+1))]}" ;;
+                            --job-index) job_index="${args[$((i+1))]}" ;;
+                            --attempt) attempt="${args[$((i+1))]}" ;;
+                            --timeout) [[ "${args[$((i+1))]}" =~ ^[0-9]+$ ]] || usage_die "logs --timeout SEC"; log_timeout="${args[$((i+1))]}" ;;
+                        esac
+                        (( i += 2 )) ;;
+                    --step) if (( i + 1 >= ${#args[@]} )) || [[ "${args[$((i+1))]}" == -* ]]; then usage_die "--step requires N"; fi; step="${args[$((i+1))]}"; step_set=true; (( i += 2 )) ;;
+                    --grep) if (( i + 1 >= ${#args[@]} )) || [[ "${args[$((i+1))]}" == -* ]]; then usage_die "--grep requires TEXT"; fi; grep_text="${args[$((i+1))]}"; grep_set=true; (( i += 2 )) ;;
+                    --ignore-case) ignore_case=true; (( i += 1 )) ;;
+                    --ndjson) ndjson=true; (( i += 1 )) ;;
                     --follow|-f) follow=true; (( i += 1 )) ;;
-                    --timeout) [[ "${args[$((i+1))]:-}" =~ ^[0-9]+$ ]] || usage_die "logs --timeout SEC"; log_timeout="${args[$((i+1))]}"; (( i += 2 )) ;;
                     -*) usage_die "actions logs: unknown argument '${args[$i]}'" ;;
                     *) [[ -z "$selector" ]] || usage_die "actions logs accepts one run selector"; selector="${args[$i]}"; (( i += 1 )) ;;
                 esac
             done
             [[ -z "$selector" || -z "$run_number" ]] || usage_die "actions logs: use a run selector or --run-number, not both"
             [[ -z "$job_id" || -z "$job_index" ]] || usage_die "actions logs: use --job or --job-index, not both"
+            local new_options=false url_job="" url_attempt=""
+            [[ "$grep_set" == true || "$ndjson" == true || "$step_set" == true ]] && new_options=true
+            [[ -z "$run_number" || "$run_number" =~ ^[0-9]+$ ]] || usage_die "Actions run number must be numeric"
+            if [[ "$new_options" == true ]]; then
+                [[ -z "$job_id" || -z "$job_index" ]] || usage_die "actions logs: use --job or --job-index, not both"
+                [[ -z "$job_id" || "$job_id" =~ ^[0-9]+$ ]] || usage_die "--job requires a REST job ID; use --job-index N or pass the full UI job URL as RUN"
+                [[ -z "$job_index" || "$job_index" =~ ^[0-9]+$ ]] || usage_die "--job-index must be a nonnegative integer"
+                [[ -z "$attempt" || "$attempt" =~ ^[1-9][0-9]*$ ]] || usage_die "--attempt must be a positive integer"
+                [[ "$step_set" != true || "$step" =~ ^[0-9]+$ ]] || usage_die "--step must be a nonnegative integer"
+            fi
+            [[ "$ignore_case" != true || "$grep_set" == true ]] || usage_die "--ignore-case requires --grep TEXT"
+            [[ "$follow" != true || ( "$grep_set" == false && "$ndjson" == false ) ]] || usage_die "--grep and --ndjson cannot be used with --follow"
+            if [[ "$new_options" == true ]]; then
+                if [[ "$selector" =~ ^https?://[^/]+/[^/]+/[^/]+/actions/runs/([0-9]+)(/jobs/([0-9]+)(/attempt/([1-9][0-9]*))?)?(/logs)?/?([?#].*)?$ ]]; then
+                    url_job="${BASH_REMATCH[3]:-}"; url_attempt="${BASH_REMATCH[5]:-}"
+                elif [[ "$selector" =~ ^https?:// ]]; then
+                    usage_die "invalid Actions job UI URL"
+                fi
+                if [[ -n "$url_job" && ( -n "$job_id" || -n "$job_index" ) ]]; then usage_die "job URL already selects a job; omit --job/--job-index"; fi
+                if [[ -n "$url_attempt" && -n "$attempt" && "$attempt" != "$url_attempt" ]]; then usage_die "URL attempt conflicts with --attempt"; fi
+                if [[ -z "$job_id" && -z "$job_index" && -z "$url_job" ]]; then usage_die "--step, --grep, and --ndjson require --job, --job-index, or a job UI URL"; fi
+            fi
             if [[ -n "$run_number" ]]; then selector="run:${run_number}"; fi
             [[ -n "$selector" ]] || usage_die "actions logs RUN | actions logs --run-number N"
             _resolve_action_run_selector "$group" "$selector"
@@ -2099,9 +2136,45 @@ cmd_actions() {
             rp=$(repo_path)
             prepare_curl_auth "$group"
             local base="${FORGEJO_URL%/}/api/v1/${rp}/actions"
+            if [[ "$new_options" == true ]]; then
+                local probe_out probe_code_file probe_code probe_err_file version_text version_major probe_rc=0
+                probe_code_file=$(mktemp "$_FGH_TMPDIR/fgh.XXXXXX")
+                probe_err_file=$(mktemp "$_FGH_TMPDIR/fgh.XXXXXX")
+                set +e
+                probe_out=$(
+                    HTTP_ALLOW_ERROR=true
+                    api_req "$group" GET "version" 2>"$probe_err_file" || exit 1
+                    _response_body
+                    printf '%s' "$HTTP_CODE" > "$probe_code_file"
+                )
+                probe_rc=$?
+                set -e
+                if (( probe_rc != 0 )); then
+                    local probe_error
+                    probe_error=$(cat "$probe_err_file" 2>/dev/null || true)
+                    rm -f "$probe_code_file" "$probe_err_file" "$_FATAL_MARK"
+                    die "filtered Actions logs require Forgejo 17 or newer (version probe failed: ${probe_error:-transport error})"
+                fi
+                rm -f "$probe_err_file"
+                rm -f "$_FATAL_MARK"
+                probe_code=$(cat "$probe_code_file" 2>/dev/null || true)
+                rm -f "$probe_code_file"
+                [[ "$probe_code" == 2* ]] || die "filtered Actions logs require Forgejo 17 or newer (version probe failed: HTTP ${probe_code:-unknown})"
+                version_text=$(jq -er '.version | strings' <<<"$probe_out" 2>/dev/null) || die "filtered Actions logs require Forgejo 17 or newer (server version unavailable or malformed)"
+                local version_number='(0|[1-9][0-9]*)'
+                local version_prerelease='(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
+                local version_pattern="^${version_number}\.${version_number}\.${version_number}(-${version_prerelease}(\.${version_prerelease})*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$"
+                [[ "$version_text" =~ $version_pattern ]] || die "filtered Actions logs require Forgejo 17 or newer (server version unavailable or malformed)"
+                version_major="${BASH_REMATCH[1]}"
+                if (( ${#version_major} < 2 )) || { (( ${#version_major} == 2 )) && (( 10#$version_major < 17 )); }; then die "filtered Actions logs require Forgejo 17 or newer (server reports $version_text)"; fi
+            fi
             if [[ -n "$job_id" ]]; then
-                local q=""
-                [[ -n "$attempt" ]] && q="?attempt=$(urlencode "$attempt")"
+                local q="" sep="?"
+                if [[ -n "$attempt" ]]; then q+="${sep}attempt=$(urlencode "$attempt")"; sep="&"; fi
+                if [[ -n "$step" ]]; then q+="${sep}step=$(urlencode "$step")"; sep="&"; fi
+                if [[ "$grep_set" == true ]]; then q+="${sep}q=$(urlencode "$grep_text")"; sep="&"; fi
+                if [[ "$ignore_case" == true ]]; then q+="${sep}qi=true"; sep="&"; fi
+                if [[ "$ndjson" == true ]]; then q+="${sep}format=ndjson"; sep="&"; fi
                 if [[ "$follow" == true ]]; then
                     _follow_job_logs "$group" "$rp" "$run_id" "$job_id" "$q" "$log_timeout"
                 else

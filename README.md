@@ -237,7 +237,9 @@ fgh actions runner token                  # deprecated compatibility endpoint
 fgh actions runner delete 3
 ```
 
-Log mechanics in Forgejo 16.0.3: `actions logs RUN` downloads the run's log ZIP and prints each `.log` member (named `{job-name}-{job-id}-attempt-{N}.log`) with `unzip -p` — never binary. `--job JOB_ID` accepts only a REST database job ID. Use `--job-index N` with a run selector for a UI job position, or pass the complete UI job URL; a URL ending in `/attempt/N` supplies the attempt automatically. `--follow` requires a selected job and polls with `Range: bytes=offset-`, printing only new bytes; it exits 0 when the job succeeds and 1 otherwise.
+Log mechanics: `actions logs RUN` downloads the run's log ZIP and prints each `.log` member (named `{job-name}-{job-id}-attempt-{N}.log`) with `unzip -p` — never binary. `--job JOB_ID` accepts only a REST database job ID. Use `--job-index N` with a run selector for a UI job position, or pass the complete UI job URL; a URL ending in `/attempt/N` supplies the attempt automatically. `--follow` requires a selected job and polls with `Range: bytes=offset-`, printing only new bytes; it exits 0 when the job succeeds and 1 otherwise.
+
+Forgejo 17+ also supports server-side job-log filters: `--step N` selects a step (including step `0`), `--grep TEXT` matches a plain substring (not a regular expression), `--ignore-case` makes that match case-insensitive, and `--ndjson` requests the server's `{time,content}` NDJSON output. `--grep` and `--ndjson` require a selected job (`--job`, `--job-index`, or a job UI URL); `--ignore-case` requires `--grep`. The CLI checks `/api/v1/version` before requesting any of these filters and fails closed unless the server reports Forgejo 17 or newer. `--grep` and `--ndjson` cannot be combined with `--follow`; `--step` can be.
 
 ### Repository
 
@@ -292,6 +294,7 @@ Export in your shell profile (optionally kept in `~/.config/fgh/config` and sour
 ## Forgejo 16.0.3 limitations
 
 - **No workflow-run rerun.** Forgejo 16.0.3 implements no rerun API for Actions; `fgh` deliberately provides no rerun command rather than faking one. Re-dispatch the workflow (`fgh actions dispatch`) or push a new commit instead.
+- **Filtered job logs require Forgejo 17+.** `--step`, `--grep`, `--ignore-case`, and `--ndjson` use server-side filtering; all require a job selector. `--grep` is a plain substring match (not a regex); `--ignore-case` requires `--grep`. `--grep` and `--ndjson` cannot be combined with `--follow`; `--step` can.
 - **Run logs are a ZIP**, not plain text; `fgh actions logs RUN` requires `unzip` to print them. Job logs (`--job`) are plaintext with no extra dependency.
 - **`--follow` is job-only** because run log archives are static snapshots; the job log endpoint answers Range requests.
 - **Package listing is owner-scoped** (Forgejo API shape), so `fgh package list` shows the repository owner's packages with optional type/name filters.
