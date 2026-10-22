@@ -146,7 +146,7 @@ EOF
     rc=0
     out="$("$FGH" actions job view 4300)" || rc=$?
     assert_contains "missing steps explains not picked up" "not been picked up by a runner" "$out"
-    assert_not_contains "missing steps has no empty table" "NUMBER NAME STATUS STARTED STOPPED" "$out"
+    assert_not_contains "missing steps has no empty table" "NUMBER" "$out"
     assert_exit "missing steps succeeds" 0 "$rc"
 
     reset_log
