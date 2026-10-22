@@ -1,0 +1,18 @@
+{
+  "id": 4242,
+  "run_id": 812,
+  "task_id": 9912,
+  "name": "Build and test",
+  "status": "success",
+  "attempt": 2,
+  "handle": "job-handle-4242",
+  "html_url": "https://forgejo.test/acme/widgets/actions/runs/812/jobs/4242",
+  "needs": ["lint", "prepare"],
+  "runs_on": ["ubuntu-latest", "x64"],
+  "steps": [
+    {"number": 3, "name": "Test", "status": "success", "started": "2026-10-21T10:03:00Z", "stopped": "2026-10-21T10:04:00Z"},
+    {"number": 0, "name": "Set up job", "status": "success", "started": "2026-10-21T10:00:00Z", "stopped": "2026-10-21T10:00:10Z"},
+    {"number": 4, "name": "Complete job", "status": "success", "started": "2026-10-21T10:04:00Z", "stopped": "2026-10-21T10:04:10Z"},
+    {"number": 2, "name": "Install", "status": "success", "started": "2026-10-21T10:01:00Z", "stopped": "2026-10-21T10:02:00Z"}
+  ]
+}
