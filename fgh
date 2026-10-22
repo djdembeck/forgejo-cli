@@ -1891,7 +1891,7 @@ _resolve_action_job_index() {
 
 # _require_forgejo17 — the Actions rerun endpoints exist only on Forgejo 17+.
 # Probes GET /api/v1/version and dies (exit 1) on <17 or an unparseable
-# version, BEFORE any rerun mutation.
+# version, BEFORE any rerun mutation (after selector lookups).
 _require_forgejo17() {
     local data version major
     data=$(api_get instance "version")
@@ -1939,7 +1939,7 @@ jobs/J is a zero-based index in the run's ID-sorted jobs, and attempt/A is
 one-based. A bare integer remains a REST ID; never strip a UI URL to its number.
 
 The rerun command requires Forgejo 17+ (16.0.3 exposes no rerun API); fgh
-probes GET /api/v1/version first and refuses to run against older versions.
+probes GET /api/v1/version before any rerun mutation (after selector lookups).
 EOF
 }
 
@@ -2275,7 +2275,6 @@ EOF
                 _resolve_action_job_index "$group" "$run_id" "$job_index"
                 resolved_job="$ACTION_JOB_ID"
             elif [[ -n "$job_id" ]]; then
-                [[ "$job_id" =~ ^[0-9]+$ ]] || usage_die "--job requires a numeric REST job ID"
                 resolved_job="$job_id"
             fi
             _require_forgejo17
@@ -2283,10 +2282,11 @@ EOF
             endpoint="$(repo_path)/actions/runs/${run_id}/rerun"
             [[ -z "$resolved_job" ]] || endpoint="$(repo_path)/actions/jobs/${resolved_job}/rerun"
             api_send "$group" POST "$endpoint" "" >/dev/null
-            [[ "$HTTP_CODE" == "204" ]] || die "unexpected HTTP $HTTP_CODE rerunning Actions run ${run_id}"
             if [[ -n "$resolved_job" ]]; then
-                echo "Reran run #${ACTION_RUN_NUMBER:-$run_id} (REST ID ${run_id}); job REST ID ${resolved_job}"
+                [[ "$HTTP_CODE" == "204" ]] || die "unexpected HTTP $HTTP_CODE rerunning Actions job ${resolved_job}"
+                echo "Reran job REST ID ${resolved_job} (selected via run #${ACTION_RUN_NUMBER:-$run_id} / REST ID ${run_id})"
             else
+                [[ "$HTTP_CODE" == "204" ]] || die "unexpected HTTP $HTTP_CODE rerunning Actions run ${run_id}"
                 echo "Reran run #${ACTION_RUN_NUMBER:-$run_id} (REST ID ${run_id})"
             fi
             ;;

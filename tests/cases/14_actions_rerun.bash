@@ -76,6 +76,7 @@ EOF
     out="$(env -u FGH_REPO "$FGH" actions rerun 'https://forgejo.test/acme/widgets/actions/runs/12/jobs/1/attempt/2' 2>/dev/null)"; rc=$?
     assert_exit "full job URL rerun succeeds" 0 "$rc"
     assert_url_call "job URL resolves sorted index" 4 "$base/actions/jobs/4243/rerun"
+    assert_method_call "job URL rerun is POST" 4 POST
     assert_contains "job URL confirmation names job ID" "4243" "$out"
 
     # A full job URL already selects a job; explicit job selectors conflict
@@ -105,6 +106,7 @@ EOF
     out="$("$FGH" actions rerun 123 --job 4242 2>/dev/null)"; rc=$?
     assert_exit "REST job rerun succeeds" 0 "$rc"
     assert_url_call "REST job endpoint selected without jobs list" 2 "$base/actions/jobs/4242/rerun"
+    assert_method_call "REST job rerun is POST" 2 POST
     assert_eq "REST job rerun makes only probe and POST" 2 "$(Log_count)"
 
     reset_log
@@ -121,7 +123,7 @@ EOF
     assert_url_call "job-index resolves sorted REST job ID" 3 "$base/actions/jobs/4242/rerun"
 
     # Conflicting and malformed options fail before any request.
-    for args in '12 --run-number 13' '12 --job 1 --job-index 0' '12 --attempt 2' '12 --job 0 --json' '12 --jq .id' '12 --unknown' '12 --job' '--run-number' '' 'not-an-id' '12 --job-index nope' '12 --limit 1'; do
+    for args in '12 --run-number 13' '12 --job 1 --job-index 0' '12 --attempt 2' '12 --job 0 --json' '12 --jq .id' '12 --unknown' '12 --job' '--run-number' '' 'not-an-id' '12 --job-index nope' '12 --job abc' '12 --limit 1'; do
         reset_log
         rc=0
         # Deliberately split a controlled option fixture as argv.
@@ -175,6 +177,39 @@ EOF
     assert_contains "version gate states Forgejo 17" "17" "$err"
     assert_contains "version gate reports detected version" "16.0.3" "$err"
     assert_eq "pre-17 gate makes no mutation" 1 "$(Log_count)"
+
+    # Lookup-first selector forms also refuse before any rerun POST:
+    # --job-index and run-number GETs precede the version probe.
+    reset_log
+    cat > "$FAKE_CURL_SCRIPT" <<'EOF'
+case "$_url" in
+  */version) Serve 200 '{"version":"16.0.3"}' ;;
+  */runs/123/jobs*) Serve 200 '[{"id":4243},{"id":4242}]' ;;
+  *) Serve 204 '' ;;
+esac
+EOF
+    rc=0; "$FGH" actions rerun 123 --job-index 0 >/dev/null 2>&1 || rc=$?
+    assert_exit "pre-17 job-index form refused" 1 "$rc"
+    assert_eq "pre-17 job-index gate allows lookup and probe only" 2 "$(Log_count)"
+    assert_method_call "pre-17 job-index gate has no POST" 2 GET
+
+    reset_log
+    rc=0; "$FGH" actions rerun 123 --job 4242 >/dev/null 2>&1 || rc=$?
+    assert_exit "pre-17 REST job form refused" 1 "$rc"
+    assert_eq "pre-17 job gate makes probe only" 1 "$(Log_count)"
+
+    reset_log
+    cat > "$FAKE_CURL_SCRIPT" <<'EOF'
+case "$_url" in
+  */version) Serve 200 '{"version":"16.0.3"}' ;;
+  *run_number=12*) Serve 200 '{"total_count":1,"workflow_runs":[{"id":9876,"index_in_repo":12}]}' ;;
+  *) Serve 204 '' ;;
+esac
+EOF
+    rc=0; "$FGH" actions rerun --run-number 12 >/dev/null 2>&1 || rc=$?
+    assert_exit "pre-17 run-number form refused" 1 "$rc"
+    assert_eq "pre-17 run-number gate allows lookup and probe only" 2 "$(Log_count)"
+    assert_method_call "pre-17 run-number gate has no POST" 2 GET
 
     reset_log
     cat > "$FAKE_CURL_SCRIPT" <<'EOF'
