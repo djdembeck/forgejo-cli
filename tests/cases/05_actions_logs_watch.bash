@@ -96,6 +96,30 @@ EOF
     assert_exit "NDJSON preserves raw bytes and trailing newline" 0 "$?"
     assert_url_contains "NDJSON format query" 2 "?format=ndjson"
 
+    # Forgejo 17 legitimately returns an empty body when a filter matches no
+    # lines; preserve the legacy empty-log error for unfiltered job logs.
+    reset_log
+    cat > "$FAKE_CURL_SCRIPT" <<'EOF'
+Serve 200 ''
+EOF
+    out="$(cd /tmp && "$FGH" actions logs 123 --job 778 2>&1 >/dev/null)"
+    assert_exit "unfiltered empty job log still fails" 1 "$?"
+    assert_contains "unfiltered empty job log error preserved" "job #778 logs are empty" "$out"
+
+    reset_log
+    cat > "$FAKE_CURL_SCRIPT" <<'EOF'
+if [[ "$_url" == */api/v1/version ]]; then
+  Serve 200 '{"version":"17.0.0"}'
+else
+  Serve 200 ''
+fi
+EOF
+    out="$(cd /tmp && "$FGH" actions logs 123 --job 778 --grep no-match 2>/dev/null)"
+    assert_success "filtered empty job log succeeds" "$?"
+    assert_empty "filtered empty job log prints no bytes" "$out"
+    assert_url_call "filtered empty job log reaches endpoint" 2 \
+        "https://forgejo.test/api/v1/repos/acme/widgets/actions/jobs/778/logs?q=no-match"
+
     # A valid job UI URL resolves the UI index through the run's sorted jobs list.
     reset_log
     cat > "$FAKE_CURL_SCRIPT" <<'EOF'
@@ -167,33 +191,82 @@ EOF
     assert_contains "follow sends Range header" "Range: bytes=0-" "$(Log_headers 2)"
 
     # Local-only invalid combinations must be rejected before selector resolution/network.
-    for selector in "123 --ignore-case" "123 --step nope" "123 --step" "123 --grep" "123 --ignore-case --grep text --follow" "123 --ndjson --follow"; do
+    # Each case is "flags|expected validation message": the flags are split into a
+    # word array so every flag arrives as its own argument, and the message proves
+    # the case reached fgh's validation logic — a combined string as one argument
+    # would instead be rejected at argv parsing ("unknown argument" / "run
+    # selector must be ..."). All cases are local: zero HTTP calls.
+    invalid_filter_cases=(
+        "123 --ignore-case|--ignore-case requires --grep TEXT"
+        "123 --step nope|--step must be a nonnegative integer"
+        "123 --step|--step requires N"
+        "123 --grep|--grep requires TEXT"
+        "123 --ignore-case --grep text --follow|--grep and --ndjson cannot be used with --follow"
+        "123 --ndjson --follow|--grep and --ndjson cannot be used with --follow"
+        "https://forgejo.test/acme/widgets/actions/runs/5 --step 1|--step, --grep, and --ndjson require --job, --job-index, or a job UI URL"
+        "https://forgejo.test/acme/widgets/actions/runs/5 --grep text|--step, --grep, and --ndjson require --job, --job-index, or a job UI URL"
+        "https://forgejo.test/acme/widgets/actions/runs/5 --ignore-case|--ignore-case requires --grep TEXT"
+        "https://forgejo.test/acme/widgets/actions/runs/5 --ndjson|--step, --grep, and --ndjson require --job, --job-index, or a job UI URL"
+        "https://forgejo.test/acme/widgets/actions/runs/5 --step nope|--step must be a nonnegative integer"
+        "https://forgejo.test/acme/widgets/actions/runs/5 --step|--step requires N"
+        "https://forgejo.test/acme/widgets/actions/runs/5 --grep|--grep requires TEXT"
+        "https://forgejo.test/acme/widgets/actions/runs/5 --ignore-case --grep text --follow|--grep and --ndjson cannot be used with --follow"
+        "https://forgejo.test/acme/widgets/actions/runs/5 --ndjson --follow|--grep and --ndjson cannot be used with --follow"
+        "--run-number 5 --step 1|--step, --grep, and --ndjson require --job, --job-index, or a job UI URL"
+        "--run-number 5 --grep text|--step, --grep, and --ndjson require --job, --job-index, or a job UI URL"
+        "--run-number 5 --ignore-case|--ignore-case requires --grep TEXT"
+        "--run-number 5 --ndjson|--step, --grep, and --ndjson require --job, --job-index, or a job UI URL"
+        "--run-number 5 --step nope|--step must be a nonnegative integer"
+        "--run-number 5 --step|--step requires N"
+        "--run-number 5 --grep|--grep requires TEXT"
+        "--run-number 5 --ignore-case --grep text --follow|--grep and --ndjson cannot be used with --follow"
+        "--run-number 5 --ndjson --follow|--grep and --ndjson cannot be used with --follow"
+    )
+    for spec in "${invalid_filter_cases[@]}"; do
+        expected_msg="${spec##*|}"; spec="${spec%%|*}"
+        selector=()
+        read -r -a selector <<<"$spec"
         reset_log
-        out="$(cd /tmp && "$FGH" actions logs "$selector" 2>&1 >/dev/null)"
+        out="$(cd /tmp && "$FGH" actions logs "${selector[@]}" 2>&1 >/dev/null)"
         rc=$?
-        assert_exit "invalid filter usage exits 2: $selector" 2 "$rc"
-        assert_eq "invalid filter has no HTTP calls: $selector" "0" "$(Log_count)"
+        label="$(printf '%s' "${selector[*]}")"
+        assert_exit "invalid filter usage exits 2: $label" 2 "$rc"
+        assert_contains "flags parsed separately, not one string: $label" "$expected_msg" "$out"
+        assert_eq "invalid filter has no HTTP calls: $label" "0" "$(Log_count)"
     done
-    for selector in "https://forgejo.test/acme/widgets/actions/runs/5 --step 1" "https://forgejo.test/acme/widgets/actions/runs/5 --grep text" "https://forgejo.test/acme/widgets/actions/runs/5 --ignore-case" "https://forgejo.test/acme/widgets/actions/runs/5 --ndjson" "https://forgejo.test/acme/widgets/actions/runs/5 --step nope" "https://forgejo.test/acme/widgets/actions/runs/5 --step" "https://forgejo.test/acme/widgets/actions/runs/5 --grep" "https://forgejo.test/acme/widgets/actions/runs/5 --ignore-case --grep text --follow" "https://forgejo.test/acme/widgets/actions/runs/5 --ndjson --follow"; do
+    # UI URL loop: the proper UI job URL is the selector prefix, passed as its own
+    # argument; each flag word arrives separately.
+    ui_url_cases=(
+        "--ignore-case|--ignore-case requires --grep TEXT"
+        "--step nope|--step must be a nonnegative integer"
+        "--step|--step requires N"
+        "--grep|--grep requires TEXT"
+        "--ignore-case --grep text --follow|--grep and --ndjson cannot be used with --follow"
+        "--ndjson --follow|--grep and --ndjson cannot be used with --follow"
+        "--step -1|--step requires N"
+        "--step 1x|--step must be a nonnegative integer"
+        "--attempt nope|--attempt must be a positive integer"
+        "--attempt 0|--attempt must be a positive integer"
+        "--job nope|--job requires a REST job ID"
+        "--job 0|job URL already selects a job"
+        "--job-index nope|--job-index must be a nonnegative integer"
+        "--job-index -1|--job-index requires a value"
+        "--attempt 2 --job 778|job URL already selects a job"
+        "--attempt 2 --job-index 0|job URL already selects a job"
+        "--job 778 --job-index 0|use --job or --job-index, not both"
+        "--attempt 2|URL attempt conflicts with --attempt"
+    )
+    for spec in "${ui_url_cases[@]}"; do
+        expected_msg="${spec##*|}"; spec="${spec%%|*}"
+        selector=()
+        read -r -a selector <<<"$spec"
         reset_log
-        out="$(cd /tmp && "$FGH" actions logs "$selector" 2>&1 >/dev/null)"
+        out="$(cd /tmp && "$FGH" actions logs 'https://forgejo.test/acme/widgets/actions/runs/5/jobs/778/attempt/3' "${selector[@]}" --ndjson 2>&1 >/dev/null)"
         rc=$?
-        assert_exit "run selector filter usage exits 2: $selector" 2 "$rc"
-        assert_eq "run selector invalid filter has no HTTP calls: $selector" "0" "$(Log_count)"
-    done
-    for selector in "--run-number 5 --step 1" "--run-number 5 --grep text" "--run-number 5 --ignore-case" "--run-number 5 --ndjson" "--run-number 5 --step nope" "--run-number 5 --step" "--run-number 5 --grep" "--run-number 5 --ignore-case --grep text --follow" "--run-number 5 --ndjson --follow"; do
-        reset_log
-        out="$(cd /tmp && "$FGH" actions logs "$selector" 2>&1 >/dev/null)"
-        rc=$?
-        assert_exit "run-number filter usage exits 2: $selector" 2 "$rc"
-        assert_eq "run-number invalid filter has no HTTP calls: $selector" "0" "$(Log_count)"
-    done
-    for selector in "--ignore-case" "--step nope" "--step" "--grep" "--ignore-case --grep text --follow" "--ndjson --follow" "--step -1" "--step 1x" "--attempt nope" "--attempt 0" "--job nope" "--job 0" "--job-index nope" "--job-index -1" "--attempt 2 --job 778" "--attempt 2 --job-index 0" "--job 778 --job-index 0" "--attempt 2"; do
-        reset_log
-        out="$(cd /tmp && "$FGH" actions logs 'https://forgejo.test/acme/widgets/actions/runs/5/jobs/778/attempt/3' "$selector" --ndjson 2>&1 >/dev/null)"
-        rc=$?
-        assert_exit "UI URL filter usage exits 2: $selector" 2 "$rc"
-        assert_eq "UI URL invalid filter has no HTTP calls: $selector" "0" "$(Log_count)"
+        label="$(printf '%s' "${selector[*]}")"
+        assert_exit "UI URL filter usage exits 2: $label" 2 "$rc"
+        assert_contains "UI URL flags parsed separately, not one string: $label" "$expected_msg" "$out"
+        assert_eq "UI URL invalid filter has no HTTP calls: $label" "0" "$(Log_count)"
     done
 
     # Empty argument must remain empty through the shell invocation.
@@ -202,13 +275,16 @@ EOF
     assert_exit "empty step value exits 2" 2 "$?"
     assert_eq "empty step value has no HTTP calls" "0" "$(Log_count)"
 
-    # Explicit invalid job/index/attempt options on a run:N selector.
-    for selector in "--job nope" "--job-index nope" "--job-index -1" "--attempt 0" "--attempt nope" "--job 778 --job-index 0"; do
+    run_selector_cases=("--job nope" "--job-index nope" "--job-index -1" "--attempt 0" "--attempt nope" "--job 778 --job-index 0")
+    for spec in "${run_selector_cases[@]}"; do
+        selector=()
+        read -r -a selector <<<"$spec"
         reset_log
-        out="$(cd /tmp && "$FGH" actions logs run:5 "$selector" --grep text 2>&1 >/dev/null)"
+        out="$(cd /tmp && "$FGH" actions logs run:5 "${selector[@]}" --grep text 2>&1 >/dev/null)"
         rc=$?
-        assert_exit "run:N invalid job filter exits 2: $selector" 2 "$rc"
-        assert_eq "run:N invalid job filter has no HTTP calls: $selector" "0" "$(Log_count)"
+        label="$(printf '%s' "${selector[*]}")"
+        assert_exit "run:N invalid job filter exits 2: $label" 2 "$rc"
+        assert_eq "run:N invalid job filter has no HTTP calls: $label" "0" "$(Log_count)"
     done
 
     # Unsupported/unknown/malformed versions and probe failure fail closed.

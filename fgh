@@ -2191,7 +2191,10 @@ cmd_actions() {
                         rm -f "$tmp"
                         die "HTTP $code fetching job #${job_id} logs"
                     fi
-                    [[ -s "$tmp" ]] || { rm -f "$tmp"; die "job #${job_id} logs are empty (job may not have started)"; }
+                    # Forgejo 17 filtered job logs legitimately return 200 with an
+                    # empty body when nothing matches (or for empty NDJSON output);
+                    # only unfiltered job logs treat empty as "not started yet".
+                    [[ "$new_options" == true || -s "$tmp" ]] || { rm -f "$tmp"; die "job #${job_id} logs are empty (job may not have started)"; }
                     cat "$tmp"
                     rm -f "$tmp"
                 fi
