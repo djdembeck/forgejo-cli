@@ -2802,7 +2802,7 @@ Commands:
              | update-branch
   release    list | view | create | edit | delete | assets | upload | delete-asset
   package    list | delete
-  actions    list | view | jobs | watch | logs | tasks | dispatch | cancel
+  actions    list | view | jobs | job | watch | logs | tasks | dispatch | cancel
              | delete | artifact | secret | variable | runner
   repo       view
   instance   version
