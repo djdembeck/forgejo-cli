@@ -1804,6 +1804,7 @@ ACTION_JOB_INDEX=""
 ACTION_URL_ATTEMPT=""
 ACTION_RUN_JSON=""
 ACTION_JOB_ID=""
+ACTION_URL_RE='^https?://([^/]+)/([^/]+)/([^/]+)/actions/runs/([0-9]+)(/jobs/([0-9]+)(/attempt/([0-9]+))?)?(/logs)?/?([?#].*)?$'
 
 _set_action_url_repo() {
     local host="$1" slug="$2" expected configured=""
@@ -1843,10 +1844,9 @@ _lookup_action_run_number() {
 
 _resolve_action_run_selector() {
     local group="$1" selector="$2"
-    local url_re='^https?://([^/]+)/([^/]+)/([^/]+)/actions/runs/([0-9]+)(/jobs/([0-9]+)(/attempt/([0-9]+))?)?(/logs)?/?([?#].*)?$'
     ACTION_RUN_ID="" ACTION_RUN_NUMBER="" ACTION_JOB_INDEX="" ACTION_URL_ATTEMPT="" ACTION_RUN_JSON=""
 
-    if [[ "$selector" =~ $url_re ]]; then
+    if [[ "$selector" =~ $ACTION_URL_RE ]]; then
         local url_host="${BASH_REMATCH[1]}" url_slug="${BASH_REMATCH[2]}/${BASH_REMATCH[3]}"
         local url_run="${BASH_REMATCH[4]}" url_job="${BASH_REMATCH[6]:-}" url_attempt="${BASH_REMATCH[8]:-}"
         _set_action_url_repo "$url_host" "$url_slug"
@@ -1889,6 +1889,23 @@ _resolve_action_job_index() {
     ACTION_JOB_ID=$(jq -r --argjson i "$index" '.[$i].id' <<<"$jobs")
 }
 
+# _require_forgejo17 — the Actions rerun endpoints exist only on Forgejo 17+.
+# Probes GET /api/v1/version and dies (exit 1) on <17 or an unparseable
+# version, BEFORE any rerun mutation.
+_require_forgejo17() {
+    local data version major
+    data=$(api_get instance "version")
+    check_fatal
+    version=$(jq -r '.version // empty' <<<"$data" 2>/dev/null || true)
+    major="${version%%.*}"
+    major="${major##* }"   # tolerate a "Forgejo " prefix
+    major="${major#v}"
+    [[ "$major" =~ ^[0-9]+$ ]] ||
+        die "Actions rerun requires Forgejo 17+, but the server version could not be determined (found '${version:-unknown}')"
+    (( 10#$major >= 17 )) ||
+        die "Actions rerun requires Forgejo 17+, found '${version}' — this server has no rerun API"
+}
+
 # ══════════════════════════════════════════════════════════════════════
 # actions
 # ══════════════════════════════════════════════════════════════════════
@@ -1906,6 +1923,7 @@ Usage: fgh actions <subcommand>
   tasks [--status S] [--limit N] [--json [FIELDS]] [--jq EXPR]   task queue
   dispatch WORKFLOW_FILE --ref REF [--input K=V]...
   cancel RUN | cancel --run-number N
+  rerun RUN | rerun --run-number N [--job JOB_ID | --job-index N]
   delete RUN | delete --run-number N
   artifact list [--run RUN | --run-number N] [--name NAME]
            | download ID OUTFILE | delete ID
@@ -1920,7 +1938,8 @@ Actions run/job URL. In a UI URL, runs/N is the per-repo run number,
 jobs/J is a zero-based index in the run's ID-sorted jobs, and attempt/A is
 one-based. A bare integer remains a REST ID; never strip a UI URL to its number.
 
-Forgejo 16.0.3 exposes no rerun API — fgh intentionally has no rerun command.
+The rerun command requires Forgejo 17+ (16.0.3 exposes no rerun API); fgh
+probes GET /api/v1/version first and refuses to run against older versions.
 EOF
 }
 
@@ -2213,6 +2232,63 @@ cmd_actions() {
                 return 0
             fi
             echo "Dispatched ${workflow} on ${ref}"
+            ;;
+        rerun)
+            if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+                cat <<'EOF'
+Usage: fgh actions rerun RUN | rerun --run-number N [--job JOB_ID | --job-index N]
+
+RUN is a REST ID, run:N, --run-number N, or full Actions run/job URL.
+--job is a REST job ID; --job-index is a zero-based UI index sorted by REST ID.
+Forgejo 17+ is required. Reruns do not support --attempt or JSON output.
+EOF
+                return 0
+            fi
+            local selector="" run_number="" job_id="" job_index="" args=()
+            [[ $# -gt 0 ]] && args=("$@")
+            local i=0
+            while (( i < ${#args[@]} )); do
+                case "${args[$i]}" in
+                    --run-number) [[ -n "${args[$((i+1))]:-}" ]] || usage_die "actions rerun --run-number N"; run_number="${args[$((i+1))]}"; (( i += 2 )) ;;
+                    --job|-j) [[ -n "${args[$((i+1))]:-}" ]] || usage_die "actions rerun RUN --job REST_JOB_ID"; job_id="${args[$((i+1))]}"; (( i += 2 )) ;;
+                    --job-index) [[ -n "${args[$((i+1))]:-}" ]] || usage_die "actions rerun RUN --job-index N"; job_index="${args[$((i+1))]}"; (( i += 2 )) ;;
+                    --attempt) usage_die "actions rerun does not support --attempt" ;;
+                    -*) usage_die "actions rerun: unknown argument '${args[$i]}'" ;;
+                    *) [[ -z "$selector" ]] || usage_die "actions rerun accepts one run selector"; selector="${args[$i]}"; (( i += 1 )) ;;
+                esac
+            done
+            [[ -z "$selector" || -z "$run_number" ]] || usage_die "actions rerun: use a run selector or --run-number, not both"
+            [[ -z "$job_id" || -z "$job_index" ]] || usage_die "actions rerun: use --job or --job-index, not both"
+            [[ -z "$job_id" || "$job_id" =~ ^[0-9]+$ ]] || usage_die "--job requires a numeric REST job ID"
+            [[ -z "$job_index" || "$job_index" =~ ^[0-9]+$ ]] || usage_die "Actions UI job index must be numeric"
+            [[ -z "$run_number" ]] || selector="run:${run_number}"
+            [[ -n "$selector" ]] || usage_die "actions rerun RUN | actions rerun --run-number N"
+            if [[ -n "$job_id$job_index" && "$selector" =~ $ACTION_URL_RE ]]; then
+                [[ -z "${BASH_REMATCH[6]}" ]] || usage_die "job URL already selects a job; omit --job/--job-index"
+            fi
+            _resolve_action_run_selector "$group" "$selector"
+            local run_id="$ACTION_RUN_ID" resolved_job=""
+            if [[ -n "$ACTION_JOB_INDEX" ]]; then
+                job_index="$ACTION_JOB_INDEX"
+            fi
+            if [[ -n "$job_index" ]]; then
+                _resolve_action_job_index "$group" "$run_id" "$job_index"
+                resolved_job="$ACTION_JOB_ID"
+            elif [[ -n "$job_id" ]]; then
+                [[ "$job_id" =~ ^[0-9]+$ ]] || usage_die "--job requires a numeric REST job ID"
+                resolved_job="$job_id"
+            fi
+            _require_forgejo17
+            local endpoint
+            endpoint="$(repo_path)/actions/runs/${run_id}/rerun"
+            [[ -z "$resolved_job" ]] || endpoint="$(repo_path)/actions/jobs/${resolved_job}/rerun"
+            api_send "$group" POST "$endpoint" "" >/dev/null
+            [[ "$HTTP_CODE" == "204" ]] || die "unexpected HTTP $HTTP_CODE rerunning Actions run ${run_id}"
+            if [[ -n "$resolved_job" ]]; then
+                echo "Reran run #${ACTION_RUN_NUMBER:-$run_id} (REST ID ${run_id}); job REST ID ${resolved_job}"
+            else
+                echo "Reran run #${ACTION_RUN_NUMBER:-$run_id} (REST ID ${run_id})"
+            fi
             ;;
         cancel)
             _resolve_simple_action_run "$group" "actions cancel RUN | actions cancel --run-number N" "$@"
@@ -2709,7 +2785,7 @@ Commands:
   release    list | view | create | edit | delete | assets | upload | delete-asset
   package    list | delete
   actions    list | view | jobs | watch | logs | tasks | dispatch | cancel
-             | delete | artifact | secret | variable | runner
+             | rerun | delete | artifact | secret | variable | runner
   repo       view
   instance   version
   api        raw REST passthrough (fallback for anything not first-class)
@@ -2726,8 +2802,8 @@ Common options on list/view commands:
 Token selection: FGH_TOKEN wins everywhere. FORGEJO_ISSUE_TOKEN is used only
 by issue/label/milestone commands; FORGEJO_TOKEN covers everything else.
 
-Forgejo 16.0.3 limitation: the Actions API has no workflow-run rerun
-endpoint, so fgh deliberately provides no rerun command.
+The actions rerun command requires Forgejo 17+; the Forgejo 16.0.3 API has no
+rerun endpoint. fgh probes the server version before attempting a rerun.
 
 Details: fgh <command> --help   (e.g. fgh issue --help)
 EOF
@@ -2810,7 +2886,7 @@ _common_opts_supported() {
         package:delete) return 1 ;;
         actions:) return 0 ;;
         actions:list|actions:view|actions:jobs|actions:tasks|actions:dispatch) return 0 ;;
-        actions:watch|actions:logs|actions:cancel|actions:delete) return 1 ;;
+        actions:watch|actions:logs|actions:cancel|actions:rerun|actions:delete) return 1 ;;
         actions:artifact) case "$subsub" in ""|list) return 0 ;; *) return 1 ;; esac ;;
         actions:secret|actions:variable) case "$subsub" in list) return 0 ;; *) return 1 ;; esac ;;
         actions:runner) case "$subsub" in ""|list|view|register|jobs) return 0 ;; *) return 1 ;; esac ;;
