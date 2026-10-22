@@ -99,7 +99,19 @@ EOF
     assert_not_contains "direct job view avoids run jobs" "actions/runs/" "$(cat "$FAKE_CURL_LOG")"
     assert_not_contains "direct job view avoids logs" "/logs" "$(cat "$FAKE_CURL_LOG")"
     assert_not_contains "direct job view avoids version probe" "/version" "$(cat "$FAKE_CURL_LOG")"
-    for value in "Build and test" "4242" "812" "success" "2" "ubuntu-latest" "x64" "https://forgejo.test/acme/widgets/actions/runs/812/jobs/4242" "lint" "prepare"; do
+    # Label-qualified metadata needles; [[:space:]]+ keeps them stable against column spacing.
+    local field value
+    while IFS='|' read -r field value; do
+        assert_eq "human output shows $field" true \
+            "$(grep -Eq "^${field}:[[:space:]]+${value}$" <<<"$out" && echo true || echo false)"
+    done <<'EOF'
+Name|Build and test
+REST ID|4242
+Run ID|812
+Status|success
+Attempt|2
+EOF
+    for value in "ubuntu-latest" "x64" "https://forgejo.test/acme/widgets/actions/runs/812/jobs/4242" "lint" "prepare"; do
         assert_contains "human output shows $value" "$value" "$out"
     done
     # The table follows numeric step order, not API order.
