@@ -2082,7 +2082,8 @@ cmd_actions() {
                         esac
                         (( i += 2 )) ;;
                     --step) if (( i + 1 >= ${#args[@]} )) || [[ "${args[$((i+1))]}" == -* ]]; then usage_die "--step requires N"; fi; step="${args[$((i+1))]}"; step_set=true; (( i += 2 )) ;;
-                    --grep) if (( i + 1 >= ${#args[@]} )) || [[ "${args[$((i+1))]}" == -* ]]; then usage_die "--grep requires TEXT"; fi; grep_text="${args[$((i+1))]}"; grep_set=true; (( i += 2 )) ;;
+                    --grep) if (( i + 1 >= ${#args[@]} )); then usage_die "--grep requires TEXT"; fi; grep_text="${args[$((i+1))]}"; grep_set=true; (( i += 2 )) ;;
+                    --grep=*) grep_text="${args[$i]#--grep=}"; grep_set=true; (( i += 1 )) ;;
                     --ignore-case) ignore_case=true; (( i += 1 )) ;;
                     --ndjson) ndjson=true; (( i += 1 )) ;;
                     --follow|-f) follow=true; (( i += 1 )) ;;
@@ -2091,12 +2092,13 @@ cmd_actions() {
                 esac
             done
             [[ -z "$selector" || -z "$run_number" ]] || usage_die "actions logs: use a run selector or --run-number, not both"
+            # Mutual exclusion is local and fires before selector resolution so
+            # explicit --job/--job-index combinations never reach the network.
             [[ -z "$job_id" || -z "$job_index" ]] || usage_die "actions logs: use --job or --job-index, not both"
-            local new_options=false url_job="" url_attempt=""
+            local new_options=false
             [[ "$grep_set" == true || "$ndjson" == true || "$step_set" == true ]] && new_options=true
             [[ -z "$run_number" || "$run_number" =~ ^[0-9]+$ ]] || usage_die "Actions run number must be numeric"
             if [[ "$new_options" == true ]]; then
-                [[ -z "$job_id" || -z "$job_index" ]] || usage_die "actions logs: use --job or --job-index, not both"
                 [[ -z "$job_id" || "$job_id" =~ ^[0-9]+$ ]] || usage_die "--job requires a REST job ID; use --job-index N or pass the full UI job URL as RUN"
                 [[ -z "$job_index" || "$job_index" =~ ^[0-9]+$ ]] || usage_die "--job-index must be a nonnegative integer"
                 [[ -z "$attempt" || "$attempt" =~ ^[1-9][0-9]*$ ]] || usage_die "--attempt must be a positive integer"
@@ -2104,16 +2106,6 @@ cmd_actions() {
             fi
             [[ "$ignore_case" != true || "$grep_set" == true ]] || usage_die "--ignore-case requires --grep TEXT"
             [[ "$follow" != true || ( "$grep_set" == false && "$ndjson" == false ) ]] || usage_die "--grep and --ndjson cannot be used with --follow"
-            if [[ "$new_options" == true ]]; then
-                if [[ "$selector" =~ ^https?://[^/]+/[^/]+/[^/]+/actions/runs/([0-9]+)(/jobs/([0-9]+)(/attempt/([1-9][0-9]*))?)?(/logs)?/?([?#].*)?$ ]]; then
-                    url_job="${BASH_REMATCH[3]:-}"; url_attempt="${BASH_REMATCH[5]:-}"
-                elif [[ "$selector" =~ ^https?:// ]]; then
-                    usage_die "invalid Actions job UI URL"
-                fi
-                if [[ -n "$url_job" && ( -n "$job_id" || -n "$job_index" ) ]]; then usage_die "job URL already selects a job; omit --job/--job-index"; fi
-                if [[ -n "$url_attempt" && -n "$attempt" && "$attempt" != "$url_attempt" ]]; then usage_die "URL attempt conflicts with --attempt"; fi
-                if [[ -z "$job_id" && -z "$job_index" && -z "$url_job" ]]; then usage_die "--step, --grep, and --ndjson require --job, --job-index, or a job UI URL"; fi
-            fi
             if [[ -n "$run_number" ]]; then selector="run:${run_number}"; fi
             [[ -n "$selector" ]] || usage_die "actions logs RUN | actions logs --run-number N"
             _resolve_action_run_selector "$group" "$selector"
@@ -2125,6 +2117,9 @@ cmd_actions() {
             if [[ -n "$ACTION_URL_ATTEMPT" ]]; then
                 [[ -z "$attempt" || "$attempt" == "$ACTION_URL_ATTEMPT" ]] || usage_die "URL attempt conflicts with --attempt"
                 attempt="$ACTION_URL_ATTEMPT"
+            fi
+            if [[ "$new_options" == true && -z "$job_id" && -z "$job_index" && -z "$ACTION_JOB_INDEX" ]]; then
+                usage_die "--step, --grep, and --ndjson require --job, --job-index, or a job UI URL"
             fi
             if [[ -n "$job_index" ]]; then
                 _resolve_action_job_index "$group" "$run_id" "$job_index"
@@ -2153,18 +2148,18 @@ cmd_actions() {
                     local probe_error
                     probe_error=$(cat "$probe_err_file" 2>/dev/null || true)
                     rm -f "$probe_code_file" "$probe_err_file" "$_FATAL_MARK"
-                    die "filtered Actions logs require Forgejo 17 or newer (version probe failed: ${probe_error:-transport error})"
+                    die "version probe failed: ${probe_error:-curl failed contacting ${base}/version}"
                 fi
                 rm -f "$probe_err_file"
                 rm -f "$_FATAL_MARK"
                 probe_code=$(cat "$probe_code_file" 2>/dev/null || true)
                 rm -f "$probe_code_file"
-                [[ "$probe_code" == 2* ]] || die "filtered Actions logs require Forgejo 17 or newer (version probe failed: HTTP ${probe_code:-unknown})"
-                version_text=$(jq -er '.version | strings' <<<"$probe_out" 2>/dev/null) || die "filtered Actions logs require Forgejo 17 or newer (server version unavailable or malformed)"
+                [[ "$probe_code" == 2* ]] || die "version probe failed: HTTP ${probe_code:-unknown}"
+                version_text=$(jq -er '.version | strings' <<<"$probe_out" 2>/dev/null) || die "server version unavailable or malformed"
                 local version_number='(0|[1-9][0-9]*)'
                 local version_prerelease='(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
                 local version_pattern="^${version_number}\.${version_number}\.${version_number}(-${version_prerelease}(\.${version_prerelease})*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$"
-                [[ "$version_text" =~ $version_pattern ]] || die "filtered Actions logs require Forgejo 17 or newer (server version unavailable or malformed)"
+                [[ "$version_text" =~ $version_pattern ]] || die "server version unavailable or malformed"
                 version_major="${BASH_REMATCH[1]}"
                 if (( ${#version_major} < 2 )) || { (( ${#version_major} == 2 )) && (( 10#$version_major < 17 )); }; then die "filtered Actions logs require Forgejo 17 or newer (server reports $version_text)"; fi
             fi

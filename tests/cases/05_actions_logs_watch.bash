@@ -190,12 +190,23 @@ EOF
         "https://forgejo.test/api/v1/repos/acme/widgets/actions/runs/123/jobs"
     assert_contains "follow sends Range header" "Range: bytes=0-" "$(Log_headers 2)"
 
-    # Local-only invalid combinations must be rejected before selector resolution/network.
+    # Invalid combinations must be rejected with a usage error.
     # Each case is "flags|expected validation message": the flags are split into a
     # word array so every flag arrives as its own argument, and the message proves
     # the case reached fgh's validation logic — a combined string as one argument
     # would instead be rejected at argv parsing ("unknown argument" / "run
-    # selector must be ..."). All cases are local: zero HTTP calls.
+    # selector must be ..."). Flag-syntax cases never touch the network; cases
+    # with a run selector (run number / run URL) resolve first, so their
+    # job-requirement check follows exactly one run-lookup call. Both loops
+    # resolve run number 5, so a lookup-successful fake server is armed; the
+    # count distinguishes "used, then died" from "local rejection".
+    cat > "$FAKE_CURL_SCRIPT" <<'EOF'
+if [[ "$_url" == */api/v1/repos/acme/widgets/actions/runs?run_number=5\&page=1\&limit=2 ]]; then
+  Serve 200 '{"workflow_runs":[{"id":123,"run_number":5}]}'
+else
+  Serve 404 '{}'
+fi
+EOF
     invalid_filter_cases=(
         "123 --ignore-case|--ignore-case requires --grep TEXT"
         "123 --step nope|--step must be a nonnegative integer"
@@ -232,7 +243,15 @@ EOF
         label="$(printf '%s' "${selector[*]}")"
         assert_exit "invalid filter usage exits 2: $label" 2 "$rc"
         assert_contains "flags parsed separately, not one string: $label" "$expected_msg" "$out"
-        assert_eq "invalid filter has no HTTP calls: $label" "0" "$(Log_count)"
+        # Local rejections (bad flag value, bare REST ID with no job selector)
+        # never touch the network. Run-URL / --run-number selectors with valid
+        # flags resolve the run — one lookup call — before the job-requirement
+        # check fires.
+        if [[ ( "$spec" == https://* || "$spec" == "--run-number 5 "* ) && ( "$spec" == *"--step 1" || "$spec" == *"--grep text" || ( "$spec" == *"--ndjson" && "$spec" != *"--follow"* ) ) ]]; then
+            assert_eq "invalid filter resolves run first: $label" "1" "$(Log_count)"
+        else
+            assert_eq "invalid filter has no HTTP calls: $label" "0" "$(Log_count)"
+        fi
     done
     # UI URL loop: the proper UI job URL is the selector prefix, passed as its own
     # argument; each flag word arrives separately.
@@ -240,7 +259,6 @@ EOF
         "--ignore-case|--ignore-case requires --grep TEXT"
         "--step nope|--step must be a nonnegative integer"
         "--step|--step requires N"
-        "--grep|--grep requires TEXT"
         "--ignore-case --grep text --follow|--grep and --ndjson cannot be used with --follow"
         "--ndjson --follow|--grep and --ndjson cannot be used with --follow"
         "--step -1|--step requires N"
@@ -266,7 +284,14 @@ EOF
         label="$(printf '%s' "${selector[*]}")"
         assert_exit "UI URL filter usage exits 2: $label" 2 "$rc"
         assert_contains "UI URL flags parsed separately, not one string: $label" "$expected_msg" "$out"
-        assert_eq "UI URL invalid filter has no HTTP calls: $label" "0" "$(Log_count)"
+        # URL-vs-flag conflicts are checked after _resolve_action_run_selector,
+        # so those cases make one run-lookup call; local rejections make none.
+        if [[ "$expected_msg" == *"job URL already selects"* || "$expected_msg" == *"URL attempt conflicts"* ]]; then
+            expected_calls=1
+        else
+            expected_calls=0
+        fi
+        assert_eq "UI URL invalid filter HTTP calls: $label" "$expected_calls" "$(Log_count)"
     done
 
     # Empty argument must remain empty through the shell invocation.
@@ -275,8 +300,9 @@ EOF
     assert_exit "empty step value exits 2" 2 "$?"
     assert_eq "empty step value has no HTTP calls" "0" "$(Log_count)"
 
-    run_selector_cases=("--job nope" "--job-index nope" "--job-index -1" "--attempt 0" "--attempt nope" "--job 778 --job-index 0")
+    run_selector_cases=("--job nope|--job requires a REST job ID" "--job-index nope|--job-index must be a nonnegative integer" "--job-index -1|--job-index requires a value" "--attempt 0|--attempt must be a positive integer" "--attempt nope|--attempt must be a positive integer")
     for spec in "${run_selector_cases[@]}"; do
+        expected_msg="${spec##*|}"; spec="${spec%%|*}"
         selector=()
         read -r -a selector <<<"$spec"
         reset_log
@@ -284,8 +310,18 @@ EOF
         rc=$?
         label="$(printf '%s' "${selector[*]}")"
         assert_exit "run:N invalid job filter exits 2: $label" 2 "$rc"
+        assert_contains "run:N invalid job filter message: $label" "$expected_msg" "$out"
         assert_eq "run:N invalid job filter has no HTTP calls: $label" "0" "$(Log_count)"
     done
+
+    # Explicit --job/--job-index is mutually exclusive and rejected locally
+    # (before resolution), even with a run selector present.
+    reset_log
+    out="$(cd /tmp && "$FGH" actions logs run:5 --job 778 --job-index 0 --grep text 2>&1 >/dev/null)"
+    rc=$?
+    assert_exit "run:N job and job-index conflict exits 2" 2 "$rc"
+    assert_contains "run:N conflict message preserved" "use --job or --job-index, not both" "$out"
+    assert_eq "run:N conflict has no HTTP calls" "0" "$(Log_count)"
 
     # Unsupported/unknown/malformed versions and probe failure fail closed.
     for profile in old malformed failure; do
@@ -307,9 +343,69 @@ EOF
         out="$(cd /tmp && "$FGH" actions logs 123 --job 778 --grep text 2>&1)"
         rc=$?
         assert_exit "${profile} version blocks filters" 1 "$rc"
-        assert_contains "${profile} error names Forgejo 17" "Forgejo 17" "$out"
+        if [[ "$profile" == "old" ]]; then
+            assert_contains "old server check names Forgejo 17" "Forgejo 17" "$out"
+        elif [[ "$profile" == "malformed" ]]; then
+            assert_contains "malformed version names cause" "server version unavailable or malformed" "$out"
+            assert_not_contains "malformed version hides Forgejo 17 headline" "Forgejo 17" "$out"
+        else
+            assert_contains "probe failure names probe failure" "version probe failed: HTTP 500" "$out"
+            assert_not_contains "probe failure hides Forgejo 17 headline" "Forgejo 17" "$out"
+        fi
         assert_eq "${profile} only probes version" "1" "$(Log_count)"
     done
+
+    # ── --grep accepts dash-prefixed and --grep=TEXT values ──
+    reset_log
+    cat > "$FAKE_CURL_SCRIPT" <<'EOF'
+if [[ "$_url" == */api/v1/version ]]; then
+  Serve 200 '{"version":"17.0.0"}'
+else
+  Serve 200 'filtered logs'
+fi
+EOF
+    out="$(cd /tmp && "$FGH" actions logs 123 --job 778 --grep --error 2>/dev/null)"
+    assert_success "dash-prefixed grep value accepted" "$?"
+    assert_url_contains "dash-prefixed grep reaches q" 2 "q=--error"
+
+    reset_log
+    out="$(cd /tmp && "$FGH" actions logs 123 --job 778 --grep=--enable-fix 2>/dev/null)"
+    assert_success "grep=TEXT form accepted" "$?"
+    assert_url_contains "grep=TEXT reaches q" 2 "q=--enable-fix"
+
+    # Transport failure (fake curl exits nonzero): the die message must name the
+    # version-probe failure, not the Forgejo 17 headline.
+    reset_log
+    printf '#!/usr/bin/env bash\nexit 7\n' > "$FAKE_CURL_SCRIPT"
+    out="$(cd /tmp && "$FGH" actions logs 123 --job 778 --grep text 2>&1)"
+    rc=$?
+    assert_exit "curl transport failure exits 1" 1 "$rc"
+    assert_contains "transport failure names probe failure" "version probe failed:" "$out"
+    assert_not_contains "transport failure hides Forgejo 17 headline" "Forgejo 17" "$out"
+
+    # A job UI URL ending in /attempt/0 parses through _resolve_action_run_selector
+    # instead of dying at the old pre-resolution grammar check.
+    reset_log
+    cat > "$FAKE_CURL_SCRIPT" <<'EOF'
+if [[ "$_url" == */api/v1/repos/acme/widgets/actions/runs?run_number=5\&page=1\&limit=2 ]]; then
+  Serve 200 '{"workflow_runs":[{"id":123,"run_number":5}]}'
+elif [[ "$_url" == */api/v1/repos/acme/widgets/actions/runs/123/jobs?page=1\&limit=50 ]]; then
+  Serve 200 '[{"id":778}]'
+elif [[ "$_url" == */api/v1/version ]]; then
+  Serve 200 '{"version":"17.0.0"}'
+else
+  Serve 404 '{}'
+fi
+EOF
+    out="$(cd /tmp && "$FGH" actions logs 'https://forgejo.test/acme/widgets/actions/runs/5/jobs/0/attempt/0' --step 0 2>&1)"
+    rc=$?
+    # The URL now parses through _resolve_action_run_selector (job 0, attempt 0);
+    # the old pre-resolution grammar used to die "invalid Actions job UI URL".
+    # Consistent with the resolver: the URL-supplied attempt 0 reaches the
+    # existing positive-integer gate instead.
+    assert_not_contains "attempt/0 no longer reports invalid job URL" "invalid Actions job UI URL" "$out"
+    assert_exit "attempt/0 URL attempt rejected by existing gate" 2 "$rc"
+    assert_contains "attempt/0 URL attempt named as non-positive" "--attempt must be a positive integer" "$out"
 
     # Unfiltered logs and attempt remain compatible without version probes.
     reset_log
