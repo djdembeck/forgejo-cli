@@ -133,7 +133,11 @@ select_token() {
 #   On non-2xx or curl failure: prints status + body to stderr; because most
 #   callers run inside $( ), a plain exit would only kill the subshell, so
 #   die/_api_fatal also plant a fatal marker checked by check_fatal().
+# HTTP_ALLOW_TRANSPORT_ERROR=true is reserved for a caller that must report a
+# primary request's error when its follow-up capability probe cannot reach the
+# server: the probe records `transport_error` in _API_STATUS_FILE.
 HTTP_ALLOW_ERROR=false
+HTTP_ALLOW_TRANSPORT_ERROR=false
 
 _api_fatal() {
     : > "$_FATAL_MARK"
@@ -161,6 +165,25 @@ prepare_curl_auth() {
     require_forgejo_url
 }
 
+_api_http_error() {
+    local method="$1" path="$2" body="$3"
+    echo "Error: HTTP $HTTP_CODE $method ${FORGEJO_URL%/}/api/v1/${path#/}" >&2
+    if jq -e . >/dev/null 2>&1 <<<"$body"; then
+        jq -r '.message // empty' <<<"$body" >&2
+        jq -r 'del(.message) | tostring' <<<"$body" | grep -qv '^{}$' && jq 'del(.message)' <<<"$body" >&2
+    elif [[ -n "$body" ]]; then
+        echo "$body" >&2
+    fi
+    return 0
+}
+
+_api_record_status() {
+    if [[ -n "${_API_STATUS_FILE:-}" ]]; then
+        printf '%s\n' "$1" > "$_API_STATUS_FILE"
+    fi
+    return 0
+}
+
 api_req() {
     local group="$1" method="$2" path="$3"
     shift 3
@@ -177,26 +200,28 @@ api_req() {
     rc=$?
     set -e
     if (( rc != 0 )); then
-        cat "$err" >&2 2>/dev/null || true
+        if [[ "$HTTP_ALLOW_TRANSPORT_ERROR" != true ]]; then
+            cat "$err" >&2 2>/dev/null || true
+        fi
         rm -rf "$HTTP_BODY_FILE" "$err"
+        if [[ "$HTTP_ALLOW_TRANSPORT_ERROR" == true ]]; then
+            HTTP_CODE=""
+            _api_record_status transport_error
+            return 1
+        fi
         echo "Error: curl failed contacting $url" >&2
         _api_fatal
     fi
     rm -f "$err"
-    case "$code" in 2*) HTTP_CODE="$code"; return 0 ;; esac
+    case "$code" in 2*) HTTP_CODE="$code"; _api_record_status "$code"; return 0 ;; esac
     HTTP_CODE="$code"
+    _api_record_status "$code"
     if [[ "$HTTP_ALLOW_ERROR" == true ]]; then
         return 0
     fi
     local body
     body=$(cat "$HTTP_BODY_FILE" 2>/dev/null || true)
-    echo "Error: HTTP $HTTP_CODE $method ${FORGEJO_URL%/}/api/v1/${path#/}" >&2
-    if jq -e . >/dev/null 2>&1 <<<"$body"; then
-        jq -r '.message // empty' <<<"$body" >&2
-        jq -r 'del(.message) | tostring' <<<"$body" | grep -qv '^{}$' && jq 'del(.message)' <<<"$body" >&2
-    elif [[ -n "$body" ]]; then
-        echo "$body" >&2
-    fi
+    _api_http_error "$method" "$path" "$body"
     rm -f "$HTTP_BODY_FILE"; HTTP_BODY_FILE=""
     _api_fatal
 }
@@ -1917,6 +1942,7 @@ Usage: fgh actions <subcommand>
             [--limit N] [--json [FIELDS]] [--jq EXPR]
   view RUN | view --run-number N [--json [FIELDS]] [--jq EXPR]
   jobs RUN | jobs --run-number N [--limit N] [--json [FIELDS]] [--jq EXPR]
+  job view JOB_ID [--json [FIELDS]] [--jq EXPR]   direct job metadata (Forgejo 17+)
   watch RUN | watch --run-number N [--timeout SEC] [--interval SEC]
   logs RUN | logs --run-number N [--job JOB_ID | --job-index N]
            [--attempt N] [--follow] [--timeout SEC]
@@ -1949,6 +1975,74 @@ cmd_actions() {
     local group="actions" sub="${1:-list}"; shift || true
     local rp
     case "$sub" in
+        job)
+            local jsub="${1:-}"; shift || true
+            [[ "$jsub" == view ]] || usage_die "actions job view JOB_ID"
+            [[ -n "${1:-}" && "$1" =~ ^[0-9]+$ ]] || usage_die "actions job view JOB_ID (numeric REST job ID)"
+            local job_id="$1"; shift || true
+            (( $# == 0 )) || usage_die "actions job view JOB_ID (numeric REST job ID)"
+            local rp
+            rp=$(repo_path)
+            check_fatal
+            local path="${rp}/actions/jobs/${job_id}"
+            local status_file="$_FGH_TMPDIR/job-status" _API_STATUS_FILE
+            _API_STATUS_FILE="$status_file"
+            HTTP_ALLOW_ERROR=true
+            local job_data job_code
+            job_data=$(api_get "$group" "$path")
+            job_code=$(cat "$status_file")
+            HTTP_ALLOW_ERROR=false
+            check_fatal
+            if [[ "$job_code" == 404 ]]; then
+                HTTP_ALLOW_ERROR=true
+                HTTP_ALLOW_TRANSPORT_ERROR=true
+                local version_data version_code version probe_transport_failed=false
+                version_data=$(api_get "$group" "version") || true
+                version_code=$(cat "$status_file")
+                [[ "$version_code" == transport_error ]] && probe_transport_failed=true
+                HTTP_ALLOW_TRANSPORT_ERROR=false
+                HTTP_ALLOW_ERROR=false
+                unset _API_STATUS_FILE
+                if [[ "$probe_transport_failed" != true ]]; then
+                    version=$(jq -r '.version // empty' <<<"$version_data" 2>/dev/null || true)
+                    if [[ "$version_code" == 200 && "$version" =~ (^|[^0-9])([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+                        local major="${BASH_REMATCH[2]}"
+                        if (( major < 17 )); then
+                            die "actions job view requires Forgejo 17 or newer (found ${version}); GET /repos/{owner}/{repo}/actions/jobs/{job_id} is unavailable"
+                        fi
+                    fi
+                fi
+                HTTP_CODE="$job_code"
+                _api_http_error GET "$path" "$job_data"
+                _api_fatal
+            fi
+            if [[ "$job_code" != 2* ]]; then
+                HTTP_CODE="$job_code"
+                _api_http_error GET "$path" "$job_data"
+                _api_fatal
+            fi
+            if structured_output <<<"$job_data"; then return 0; fi
+            jq -r '
+                "Name:    \(.name // "-")",
+                "REST ID: \(.id // "-")",
+                "Run ID:  \(.run_id // "-")",
+                "Status:  \(.status // "-")",
+                "Attempt: \(.attempt // "-")",
+                "Runs on: \((.runs_on // []) | join(", "))",
+                "URL:     \(.html_url // "-")",
+                "Needs:   \((.needs // []) | join(", "))"
+            ' <<<"$job_data"
+            if jq -e '.steps | type == "array" and length > 0' >/dev/null <<<"$job_data"; then
+                printf '\nSteps:\n'
+                jq -r '.steps | sort_by(.number) | .[] |
+                    [.number,.name,.status,.started,.stopped] |
+                    map(. // "-") | map(tostring) | join("\t")' <<<"$job_data" |
+                    { printf 'NUMBER\tNAME\tSTATUS\tSTARTED\tSTOPPED\n'; cat; } |
+                    column -t -s "$(printf '\t')"
+            else
+                printf '\nThis job has not been picked up by a runner yet; no step list is available.\n'
+            fi
+            ;;
         list)
             local status="" event="" ref="" workflow="" run_number="" args=()
             [[ $# -gt 0 ]] && args=("$@")
@@ -2559,8 +2653,8 @@ EOF
 # Range-aware job-log follow. Polls GET /actions/jobs/{id}/logs with
 # Range: bytes=<offset>- (server answers 206 + new bytes, or 200 full), appends
 # exactly the new bytes to stdout, and exits when the parent run reaches a
-# terminal state or --timeout elapses. There is no single-job GET endpoint in
-# Forgejo 16.0.3, so terminal status is detected from the run's job list.
+# terminal state or --timeout elapses. The direct job metadata endpoint is
+# unavailable on Forgejo 16.0.3, so terminal status is detected from the run's job list.
 _follow_job_logs() {
     local group="$1" rp="$2" run_id="$3" job_id="$4" query="$5" timeout="$6"
     local logtmp interval=3 offset=0 deadline=0 code rc=0 status
@@ -2784,7 +2878,7 @@ Commands:
              | update-branch
   release    list | view | create | edit | delete | assets | upload | delete-asset
   package    list | delete
-  actions    list | view | jobs | watch | logs | tasks | dispatch | cancel
+  actions    list | view | jobs | job | watch | logs | tasks | dispatch | cancel
              | rerun | delete | artifact | secret | variable | runner
   repo       view
   instance   version
@@ -2885,7 +2979,7 @@ _common_opts_supported() {
         package:|package:list) return 0 ;;
         package:delete) return 1 ;;
         actions:) return 0 ;;
-        actions:list|actions:view|actions:jobs|actions:tasks|actions:dispatch) return 0 ;;
+        actions:list|actions:view|actions:jobs|actions:job|actions:tasks|actions:dispatch) return 0 ;;
         actions:watch|actions:logs|actions:cancel|actions:rerun|actions:delete) return 1 ;;
         actions:artifact) case "$subsub" in ""|list) return 0 ;; *) return 1 ;; esac ;;
         actions:secret|actions:variable) case "$subsub" in list) return 0 ;; *) return 1 ;; esac ;;

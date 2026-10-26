@@ -1,0 +1,12 @@
+{
+  "id": 4300,
+  "run_id": 813,
+  "task_id": 9920,
+  "name": "Queued build",
+  "status": "queued",
+  "attempt": 1,
+  "handle": "job-handle-4300",
+  "html_url": "https://forgejo.test/acme/widgets/actions/runs/813/jobs/4300",
+  "needs": [],
+  "runs_on": ["ubuntu-latest"]
+}
