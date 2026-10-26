@@ -1,6 +1,6 @@
 # forgejo-cli
 
-`fgh` is a zero-install, single-file Bash CLI for Forgejo, targeting **Forgejo 16.0.3**, with `gh`-style commands and first-class Actions coverage.
+`fgh` is a zero-install, single-file Bash CLI for Forgejo, targeting **Forgejo 16.0.3** for its baseline API and supporting Actions reruns on **Forgejo 17+**, with `gh`-style commands and first-class Actions coverage.
 
 `fgh` wraps the Forgejo v1 REST API in a `gh`-style command model for developers and DevOps engineers running self-hosted Forgejo. It auto-detects the repository from the current Git remote, accepts an `FGH_REPO` or `-R owner/repo` override, and is configured entirely through environment variables. Issues, labels, milestones, pull requests (including reviews, reviewers, checks, and merge), releases and their assets, packages, and Forgejo Actions (runs, jobs, logs, artifacts, secrets, variables, runners, dispatch) are all first-class commands. Anything not first-class is reachable through `fgh api`.
 
@@ -194,9 +194,11 @@ fgh package delete container myimage 1.2.3     # TYPE NAME VERSION
 
 ### Actions
 
-`fgh actions` covers Forgejo 16.0 workflow runs, jobs, logs, the task queue, dispatch, artifacts, secrets, variables, and runners.
+`fgh actions` covers Forgejo 16.0 workflow runs, jobs, logs, the task queue, dispatch, artifacts, secrets, variables, and runners. Workflow reruns and direct job metadata lookup (`actions job view`) require Forgejo 17 or newer.
 
 Forgejo uses different identifiers in its UI and REST API. In a UI URL such as `.../actions/runs/157/jobs/3/attempt/1`, `157` is the per-repository run number, `3` is a zero-based position in the run's ID-sorted jobs, and `1` is the one-based attempt. REST detail/log endpoints require database IDs instead. A bare integer passed to `fgh` remains a REST ID for compatibility; use `--run-number N`, `run:N`, or the complete UI URL when starting from Forgejo's UI. Full URLs are resolved to the correct repository, run ID, job ID, and attempt.
+
+Direct job view returns metadata and per-step status/timing only; it does not fetch logs. It uses the REST database job ID (not the run-relative UI job index).
 
 ```bash
 fgh actions list [--status S] [--event E] [--ref R] [--workflow ID] [--run-number N]
@@ -204,6 +206,10 @@ fgh actions view 3493                     # REST database ID
 fgh actions view --run-number 157         # UI run number
 fgh actions view 'https://forgejo.example/o/r/actions/runs/157'
 fgh actions jobs --run-number 157         # shows UI INDEX and REST ID
+fgh actions job view 4242                  # direct metadata; JOB_ID is a numeric REST ID (Forgejo 17+)
+fgh actions job view 4242 --json           # unchanged ActionRunJob object, including steps
+fgh actions job view 4242 --jq '.steps[].number'
+fgh actions job view 4242 --json id,status,attempt
 fgh actions watch --run-number 157 [--timeout SEC] [--interval SEC]
 fgh actions tasks [--status queued]       # task queue listing
 
@@ -215,6 +221,10 @@ fgh actions logs 3493 --job 8542 --follow [--timeout SEC]
 
 fgh actions dispatch deploy.yml --ref main --input region=eu-west-1
 fgh actions cancel --run-number 157
+fgh actions rerun 3493                    # REST run ID; Forgejo 17+
+fgh actions rerun --run-number 157       # UI run number
+fgh actions rerun 3493 --job 8542        # rerun this completed job and its dependents
+fgh actions rerun --run-number 157 --job-index 3
 fgh actions delete 3493                   # REST ID
 
 fgh actions artifact list --run-number 157 [--name NAME]
@@ -293,7 +303,7 @@ Export in your shell profile (optionally kept in `~/.config/fgh/config` and sour
 
 ## Forgejo 16.0.3 limitations
 
-- **No workflow-run rerun.** Forgejo 16.0.3 implements no rerun API for Actions; `fgh` deliberately provides no rerun command rather than faking one. Re-dispatch the workflow (`fgh actions dispatch`) or push a new commit instead.
+- **Workflow reruns require Forgejo 17+.** `fgh actions rerun RUN` reruns a completed run; `--job JOB_ID` or `--job-index N` reruns a completed job and its dependent jobs. The command accepts REST run IDs, `--run-number N`, `run:N`, and full run/job URLs. It is write-only (no `--json`/`--jq` output or attempt selection) and refuses to mutate instances reporting a version below 17.
 - **Filtered job logs require Forgejo 17+.** `--step`, `--grep`, `--ignore-case`, and `--ndjson` use server-side filtering; all require a job selector. `--grep` is a plain substring match (not a regex); `--ignore-case` requires `--grep`. `--grep` and `--ndjson` cannot be combined with `--follow`; `--step` can.
 - **Run logs are a ZIP**, not plain text; `fgh actions logs RUN` requires `unzip` to print them. Job logs (`--job`) are plaintext with no extra dependency.
 - **`--follow` is job-only** because run log archives are static snapshots; the job log endpoint answers Range requests.
